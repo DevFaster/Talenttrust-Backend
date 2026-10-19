@@ -1,6 +1,6 @@
 import request from 'supertest';
 import { createApp } from '../src/app';
-import { EscrowStore } from '../src/store';
+import { EscrowStore, type EscrowContract } from '../src/store';
 import { createLogger, type Logger } from '../src/logger';
 
 function captureLogger(): { logger: Logger; lines: Record<string, unknown>[] } {
