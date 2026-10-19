@@ -1,0 +1,127 @@
+import request from 'supertest';
+import { createApp } from '../src/app';
+import { EscrowStore } from '../src/store';
+import { createLogger, type Logger } from '../src/logger';
+
+function captureLogger(): { logger: Logger; lines: Record<string, unknown>[] } {
+  const lines: Record<string, unknown>[] = [];
+  const logger = createLogger({
+    level: 'debug',
+    stream: {
+      write: (chunk: unknown) => {
+        try {
+          lines.push(JSON.parse(String(chunk)));
+        } catch {
+          // ignore non-JSON chunks
+        }
+        return true;
+      },
+    } as unknown as NodeJS.WriteStream,
+  });
+  return { logger, lines };
+}
+
+class ThrowingStore extends EscrowStore {
+  override get(_id: number) {
+    throw new Error('boom');
+  }
+}
+
+describe('structured request logging', () => {
+  it('echoes a valid X-Request-Id in header and body', async () => {
+    const { logger, lines } = captureLogger();
+    const app = createApp({ store: new EscrowStore(), logger });
+    const res = await request(app)
+      .get('/api/v1/contracts/1')
+      .set('x-request-id', 'valid-req-0001');
+    expect(res.status).toBe(200);
+    expect(res.headers['x-request-id']).toBe('valid-req-0001');
+    expect(lines.some((l) => l.level === 'info' && l.msg === 'request')).toBe(true);
+  });
+
+  it('replaces an invalid X-Request-Id (too short, spaces, newlines)', async () => {
+    const cases = ['abc', 'a b c', 'a\r\nb', 'a\nb', 'has space', 'x'.repeat(200)];
+    for (const input of cases) {
+      const { logger, lines } = captureLogger();
+      const app = createApp({ store: new EscrowStore(), logger });
+      const res = await request(app).get('/api/v1/contracts/1').set('x-request-id', input);
+      expect(res.status).toBe(200);
+      const echoed = res.headers['x-request-id'];
+      expect(echoed).not.toBe(input);
+      expect(/^[A-Za-z0-9._-]{8,128}$/.test(echoed as string)).toBe(true);
+      expect((res.body as { requestId?: string }).requestId).toBe(echoed);
+      // no CR/LF ever reaches logs or headers
+      for (const line of lines) {
+        expect(String(line)).not.toMatch(/\r|\n/);
+      }
+    }
+  });
+
+  it('includes requestId in 404 and 400 error bodies', async () => {
+    const { logger, lines } = captureLogger();
+    const app = createApp({ store: new EscrowStore(), logger });
+
+    const notFound = await request(app).get('/api/v1/contracts/99999').set('x-request-id', 'notfound-req-0001');
+    expect(notFound.status).toBe(404);
+    expect((notFound.body as { requestId?: string }).requestId).toBe('notfound-req-0001');
+    expect(notFound.headers['x-request-id']).toBe('notfound-req-0001');
+
+    const bad = await request(app)
+      .post('/api/v1/contracts')
+      .send({ client: 'GA', freelancer: 'GA', milestones: [1] })
+      .set('x-request-id', 'badreq-0001');
+    expect(bad.status).toBe(400);
+    expect((bad.body as { requestId?: string }).requestId).toBe('badreq-0001');
+    expect(bad.headers['x-request-id']).toBe('badreq-0001');
+  });
+
+  it('logs a throwing route with stack and matching requestId exactly once', async () => {
+    const { logger, lines } = captureLogger();
+    const app = createApp({ store: new ThrowingStore(), logger });
+    const res = await request(app).get('/api/v1/contracts/999').set('x-request-id', 'throw-req-0001');
+    expect(res.status).toBe(500);
+    expect((res.body as { requestId?: string }).requestId).toBe('throw-req-0001');
+    expect(res.headers['x-request-id']).toBe('throw-req-0001');
+
+    const errorLines = lines.filter(
+      (l) => l.level === 'error' && l.msg === 'unhandled_error' && l.err && l.err.stack,
+    );
+    expect(errorLines).toHaveLength(1);
+    expect(String(errorLines[0].err.stack)).toContain('boom');
+    expect(errorLines[0].requestId).toBe('throw-req-0001');
+    // no stack leaks into the response body
+    expect((res.body as { error?: string; message?: string }).stack).toBeUndefined();
+  });
+
+  it('never logs authorization / x-api-key values', async () => {
+    const { logger, lines } = captureLogger();
+    const app = createApp({ store: new EscrowStore(), logger });
+    const secret = 'super-secret-api-key';
+    await request(app)
+      .get('/api/v1/contracts/1')
+      .set('authorization', `Bearer ${secret}`)
+      .set('x-api-key', secret)
+      .set('cookie', `session=${secret}`);
+    for (const line of lines) {
+      const text = JSON.stringify(line);
+      expect(text).not.toContain(secret);
+      expect(text).not.toContain(`Bearer ${secret}`);
+    }
+  });
+
+  it('produces no output when LOG_LEVEL=silent', async () => {
+    const lines: Record<string, unknown>[] = [];
+    const silent = createLogger({
+      level: 'silent',
+      stream: {
+        write: (chunk: unknown) => {
+          lines.push(JSON.parse(String(chunk)));
+          return true;
+        },
+      } as unknown as NodeJS.WriteStream,
+    });
+    const app = createApp({ store: new EscrowStore(), logger: silent });
+    await request(app).get('/api/v1/contracts/1');
+    expect(lines.length).toBe(0);
+  });
+});
