@@ -1,4 +1,3 @@
-import { WriteStream } from 'node:stream';
 import { randomUUID } from 'node:crypto';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'silent';
@@ -29,7 +28,7 @@ function redactHeaders(headers: Record<string, string | string[] | undefined>): 
   return out;
 }
 
-export function createLogger(opts: { level?: LogLevel; stream?: WriteStream } = {}): Logger {
+export function createLogger(opts: { level?: LogLevel; stream?: NodeJS.WriteStream } = {}): Logger {
   const envLevel = (process.env.LOG_LEVEL || '').toLowerCase() as LogLevel | undefined;
   const defaultLevel = process.env.NODE_ENV === 'test' ? 'silent' : 'info';
   const level = opts.level ?? envLevel ?? defaultLevel;

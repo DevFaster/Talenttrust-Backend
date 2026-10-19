@@ -22,7 +22,7 @@ function captureLogger(): { logger: Logger; lines: Record<string, unknown>[] } {
 }
 
 class ThrowingStore extends EscrowStore {
-  override get(_id: number) {
+  override get(_id: number): EscrowContract {
     throw new Error('boom');
   }
 }
@@ -84,13 +84,13 @@ describe('structured request logging', () => {
     expect(res.headers['x-request-id']).toBe('throw-req-0001');
 
     const errorLines = lines.filter(
-      (l) => l.level === 'error' && l.msg === 'unhandled_error' && l.err && l.err.stack,
+      (l) => l.level === 'error' && l.msg === 'unhandled_error' && l.err && (l.err as { stack?: unknown }).stack,
     );
     expect(errorLines).toHaveLength(1);
-    expect(String(errorLines[0].err.stack)).toContain('boom');
+    expect(String((errorLines[0].err as { stack?: unknown }).stack)).toContain('boom');
     expect(errorLines[0].requestId).toBe('throw-req-0001');
     // no stack leaks into the response body
-    expect((res.body as { error?: string; message?: string }).stack).toBeUndefined();
+    expect((res.body as { stack?: unknown }).stack).toBeUndefined();
   });
 
   it('never logs authorization / x-api-key values', async () => {
