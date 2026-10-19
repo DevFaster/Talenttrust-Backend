@@ -3,7 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { config, explorerUrl } from './config';
-import { EscrowStore, HttpError } from './store';
+import { EscrowStore, HttpError, type QueryFilters } from './store';
 import { openapi, docsHtml } from './openapi';
 
 const startedAt = Date.now();
@@ -188,8 +188,8 @@ function parseCursorParam(cursor: unknown, sort: string): { sort: string; lastVa
   return { sort: sort, lastValue: String(obj.lastValue ?? ''), lastId: Number(obj.lastId ?? 0) };
 }
 
-function parseFilters(q: Request['query']): import('./store').QueryFilters {
-  const f: import('./store').QueryFilters = {};
+function parseFilters(q: Request['query']): QueryFilters {
+  const f: QueryFilters = {};
   if (typeof q.status === 'string') {
     f.status = q.status.split(',').map((s) => s.trim()).filter(Boolean);
     for (const status of f.status) {
