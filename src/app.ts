@@ -3,7 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { config, explorerUrl } from './config';
-import { EscrowStore, HttpError, type QueryFilters } from './store';
+import { EscrowStore, HttpError, type Cursor, type QueryFilters } from './store';
 import { openapi, docsHtml } from './openapi';
 
 const startedAt = Date.now();
@@ -99,7 +99,7 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
       const after = parseCursorParam(req.query.cursor, sort);
       const filters = parseFilters(req.query);
       const result = store.query({ filters, sort, limit, after });
-      res.json({ data: result.data, page: { limit, nextCursor: result.nextCursor, hasMore: result.hasMore } });
+      res.json({ data: result.data, page: { limit, nextCursor: result.nextCursor ? serializeCursor(result.nextCursor) : null, hasMore: result.hasMore } });
     }),
   );
   v1.post(
@@ -208,6 +208,12 @@ function parseFilters(q: Request['query']): QueryFilters {
   if (typeof q.createdAfter === 'string') f.createdAfter = q.createdAfter;
   if (typeof q.createdBefore === 'string') f.createdBefore = q.createdBefore;
   return f;
+}
+
+function serializeCursor(cursor: Cursor): string {
+  const payload = Buffer.from(JSON.stringify({ sort: cursor.sort, lastValue: cursor.lastValue, lastId: cursor.lastId })).toString('base64url');
+  const sig = createHmac('sha256', CURSOR_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
 }
 
 export default createApp;
