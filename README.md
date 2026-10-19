@@ -26,7 +26,7 @@ data is per-instance and resets on redeploy.
 | GET | `/openapi.json` | OpenAPI 3 spec |
 | GET | `/api/v1/chain` | On-chain contract deployment info |
 | GET | `/api/v1/stats` | Aggregate statistics |
-| GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`) / create escrow contracts |
+| GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`, `?role=`, `?token=`, `?sort=`, `?limit=`, `?cursor=`) / create escrow contracts; responses include `{ data, page: { limit, nextCursor, hasMore } }` |
 | GET | `/api/v1/contracts/:id` | Get a contract |
 | POST | `/api/v1/contracts/:id/deposit` | `{ "amount": 100 }` |
 | POST | `/api/v1/contracts/:id/milestones/:index/release` | Release a milestone |
@@ -47,7 +47,7 @@ npm run build && npm start
 ```
 
 Configuration (all optional, see `.env.example`): `PORT`, `ESCROW_CONTRACT_ID`, `STELLAR_NETWORK`,
-`STELLAR_RPC_URL`, `FRONTEND_URL`.
+`STELLAR_RPC_URL`, `FRONTEND_URL`, `CURSOR_SECRET` (signs contract-list cursors; random per-process default).
 
 ## Deployment
 
