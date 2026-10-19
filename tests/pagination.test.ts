@@ -81,7 +81,7 @@ describe('contract list pagination, sorting and filters', () => {
     const sorts: string[] = ['createdAt', '-createdAt', 'updatedAt', '-updatedAt', 'totalAmount', '-totalAmount'];
     for (const sort of sorts) {
       const res = await request(app).get(`/api/v1/contracts?sort=${sort}&limit=100`);
-      expect(res.status).toBe(200, `sort ${sort}`);
+      expect(res.status).toBe(200);
       const ids = res.body.data.map((c: { id: number }) => c.id);
       if (sort === '-totalAmount') {
         expect(ids).toEqual([4, 1, 2, 3, 5]); // 200 first, then 100s tie-broken by id asc, then 50
