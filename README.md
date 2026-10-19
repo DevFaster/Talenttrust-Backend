@@ -35,6 +35,7 @@ data is per-instance and resets on redeploy.
 | POST | `/api/v1/contracts/:id/cancel` | Cancel and refund |
 | POST | `/api/v1/contracts/:id/reputation` | `{ "rating": 5 }` |
 | GET | `/api/v1/reputation/:address` | Freelancer reputation |
+| GET | `/metrics` | Prometheus exposition-format metrics (requires `Authorization: Bearer <METRICS_TOKEN>`; disabled when `METRICS_TOKEN` unset) |
 
 ## Development
 
@@ -47,7 +48,7 @@ npm run build && npm start
 ```
 
 Configuration (all optional, see `.env.example`): `PORT`, `ESCROW_CONTRACT_ID`, `STELLAR_NETWORK`,
-`STELLAR_RPC_URL`, `FRONTEND_URL`.
+`STELLAR_RPC_URL`, `FRONTEND_URL`, `METRICS_TOKEN` (protects `GET /metrics`; when unset the endpoint is disabled).
 
 ## Deployment
 
