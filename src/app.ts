@@ -170,8 +170,8 @@ function parseSortParam(v: unknown): string {
   return s;
 }
 
-function parseCursorParam(cursor: unknown, sort: string): { sort: string; lastValue: string; lastId: number } | null {
-  if (cursor === undefined || cursor === null || cursor === '') return null;
+function parseCursorParam(cursor: unknown, sort: string): { sort: string; lastValue: string; lastId: number } | undefined {
+  if (cursor === undefined || cursor === null || cursor === '') return undefined;
   const cursorStr = typeof cursor === 'string' ? cursor : String(cursor);
   const parts = cursorStr.split('.');
   if (parts.length !== 2) throw new HttpError(400, 'invalid_cursor', 'invalid cursor');

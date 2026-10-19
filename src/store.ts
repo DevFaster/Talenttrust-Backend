@@ -111,8 +111,9 @@ export class EscrowStore {
     const { field, desc } = parseSort(sort);
     let items = [...this.contracts.values()].filter((c) => matchesFilters(c, opts.filters));
     items.sort((a, b) => compareContracts(a, b, field, desc));
-    if (opts.after) {
-      items = items.filter((c) => isAfterCursor(c, opts.after, field, desc));
+    const after = opts.after;
+    if (after) {
+      items = items.filter((c) => isAfterCursor(c, after, field, desc));
     }
     const raw = items.slice(0, limit + 1);
     const hasMore = raw.length > limit;
@@ -120,7 +121,7 @@ export class EscrowStore {
     let nextCursor: Cursor | null = null;
     if (hasMore) {
       const last = data[data.length - 1];
-      nextCursor = { sort, lastValue: sortValue(last, field), lastId: last.id };
+      nextCursor = { sort, lastValue: String(sortValue(last, field)), lastId: last.id };
     }
     return { data, hasMore, nextCursor };
   }
