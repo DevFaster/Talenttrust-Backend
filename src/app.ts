@@ -197,6 +197,7 @@ export function createApp(
       return;
     }
     logger.error('unhandled_error', {
+      requestId,
       err: {
         name: (err as Error)?.name ?? 'Error',
         message: (err as Error)?.message ?? String(err),
