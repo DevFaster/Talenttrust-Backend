@@ -57,10 +57,6 @@ export function createApp(
   const { store, logger } = resolveStoreAndLogger(storeOrOpts);
   const app = express();
   app.disable('x-powered-by');
-  app.use(helmet({ contentSecurityPolicy: false }));
-  app.use(cors());
-  app.use(express.json({ limit: '100kb' }));
-
   // Correlation id: echo a valid inbound X-Request-Id, otherwise generate one.
   // The regex excludes CR/LF so a client cannot inject log-line terminators.
   app.use((req, res, next) => {
@@ -68,9 +64,13 @@ export function createApp(
     const value = Array.isArray(incoming) ? incoming[0] : incoming;
     const requestId = value && REQUEST_ID_RE.test(value) ? (value as string) : randomUUID();
     req.id = requestId;
-    res.setHeader('X-Request-Id', requestId);
+    res.set('X-Request-Id', requestId);
     next();
   });
+
+  app.use(helmet({ contentSecurityPolicy: false }));
+  app.use(cors());
+  app.use(express.json({ limit: '100kb' }));
 
   // Structured access log on response finish.
   app.use((req, res, next) => {
