@@ -55,7 +55,7 @@ export function createApp(store: EscrowStore = new EscrowStore().seed(), opts: {
     const start = Date.now();
     res.on('finish', () => {
       const durationSeconds = (Date.now() - start) / 1000;
-      const route = req.route ? req.path.replace(/\/\d+/g, '/:id') : 'unmatched';
+      const route = req.route ? String(req.baseUrl || '') + String(req.route.path || '') : 'unmatched';
       httpRequestsTotal.inc({ method: req.method, route, status: String(res.statusCode) });
       httpRequestDuration.observe({ method: req.method, route }, durationSeconds);
     });
