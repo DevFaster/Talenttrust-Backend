@@ -108,20 +108,10 @@ describe('Prometheus metrics', () => {
     const app2 = createApp(new EscrowStore());
     const res2 = await request(app2).get('/metrics').set('authorization', 'Bearer test-token');
     expect(res2.status).toBe(200);
-    const value = metricValue(res2.text, 'http_requests_total', {
-      method: 'GET',
-      route: '/api/v1/contracts/:id',
-      status: '200',
-    });
-    expect(value).toBeUndefined();
+    expect(res2.text).not.toContain('method="GET",route="/api/v1/contracts/:id",status="200"');
 
     const res1 = await request(app1).get('/metrics').set('authorization', 'Bearer test-token');
     expect(res1.status).toBe(200);
-    const value1 = metricValue(res1.text, 'http_requests_total', {
-      method: 'GET',
-      route: '/api/v1/contracts/:id',
-      status: '200',
-    });
-    expect(value1).toBeGreaterThanOrEqual(1);
+    expect(res1.text).toContain('method="GET",route="/api/v1/contracts/:id",status="200"');
   });
 });
