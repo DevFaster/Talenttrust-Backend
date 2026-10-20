@@ -30,7 +30,7 @@ class ThrowingStore extends EscrowStore {
 describe('structured request logging', () => {
   it('echoes a valid X-Request-Id in header and body', async () => {
     const { logger, lines } = captureLogger();
-    const app = createApp({ store: new EscrowStore(), logger });
+    const app = createApp({ store: new EscrowStore().seed(), logger });
     const res = await request(app)
       .get('/api/v1/contracts/1')
       .set('x-request-id', 'valid-req-0001');
@@ -43,7 +43,7 @@ describe('structured request logging', () => {
     const cases = ['abc', 'a b c', 'a\r\nb', 'a\nb', 'has space', 'x'.repeat(200)];
     for (const input of cases) {
       const { logger, lines } = captureLogger();
-      const app = createApp({ store: new EscrowStore(), logger });
+      const app = createApp({ store: new EscrowStore().seed(), logger });
       const res = await request(app).get('/api/v1/contracts/1').set('x-request-id', input);
       expect(res.status).toBe(200);
       const echoed = res.headers['x-request-id'];
