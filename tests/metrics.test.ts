@@ -23,13 +23,10 @@ function metricSample(body: string, name: string, labels: Record<string, string>
   return undefined;
 }
 
-function appWithToken(token = 'test-token') {
-  process.env.METRICS_TOKEN = token;
-  const app = createApp(new EscrowStore());
-  return { app };
-}
-
 describe('Prometheus metrics', () => {
+  beforeEach(() => {
+    process.env.METRICS_TOKEN = 'test-token';
+  });
   afterEach(() => {
     delete process.env.METRICS_TOKEN;
   });
@@ -50,19 +47,19 @@ describe('Prometheus metrics', () => {
   });
 
   it('returns 401 without a token', async () => {
-    const { app } = appWithToken();
+    const app = createApp(new EscrowStore());
     const res = await request(app).get('/metrics');
     expect(res.status).toBe(401);
   });
 
   it('returns 401 with a wrong token', async () => {
-    const { app } = appWithToken();
+    const app = createApp(new EscrowStore());
     const res = await request(app).get('/metrics').set('authorization', 'Bearer wrong-token');
     expect(res.status).toBe(401);
   });
 
   it('returns 200 with valid exposition format', async () => {
-    const { app } = appWithToken();
+    const app = createApp(new EscrowStore());
     const res = await request(app).get('/metrics').set('authorization', 'Bearer test-token');
     expect(res.status).toBe(200);
     expect(res.headers['content-type'] || '').toContain('text/plain');
@@ -75,7 +72,7 @@ describe('Prometheus metrics', () => {
   });
 
   it('counts requests by route pattern, not raw path', async () => {
-    const { app } = appWithToken();
+    const app = createApp(new EscrowStore());
     for (let i = 0; i < 3; i++) {
       await request(app).get('/api/v1/contracts/999').expect(404);
     }
@@ -90,7 +87,7 @@ describe('Prometheus metrics', () => {
   });
 
   it('increments escrow_mutations_total for over_funded deposit', async () => {
-    const { app } = appWithToken();
+    const app = createApp(new EscrowStore());
     const created = await request(app)
       .post('/api/v1/contracts')
       .send({ client: 'GA', freelancer: 'GB', milestones: [{ amount: 100 }] })
@@ -106,7 +103,6 @@ describe('Prometheus metrics', () => {
   });
 
   it('does not share counters between two createApp() instances', async () => {
-    process.env.METRICS_TOKEN = 'test-token';
     const app1 = createApp(new EscrowStore().seed());
     await request(app1).get('/api/v1/contracts/1').expect(200);
 
@@ -128,6 +124,5 @@ describe('Prometheus metrics', () => {
       status: '200',
     });
     expect(value1).toBeGreaterThanOrEqual(1);
-    delete process.env.METRICS_TOKEN;
   });
 });
