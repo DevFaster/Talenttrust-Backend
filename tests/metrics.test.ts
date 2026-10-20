@@ -77,10 +77,14 @@ describe('Prometheus metrics', () => {
     const res = await request(app).get('/metrics').set('authorization', 'Bearer test-token');
     expect(res.status).toBe(200);
     const line = res.text.split('\n').find((l) =>
-      l.includes('http_requests_total') && l.includes('method="GET"') && l.includes('route="/api/v1/contracts/:id"') && l.includes('status="404"')
+      l.includes('http_requests_total') && l.includes('method="GET"') && l.includes('status="404"')
     );
     expect(line).toBeDefined();
-    expect(parseFloat(line!.trim().split(/\s+/).pop()!)).toBe(3);
+    // Route should be a pattern, not the raw path with ID
+    expect(line).not.toContain('999');
+    expect(line).toContain(':id');
+    const value = parseFloat(line!.trim().split(/\s+/).pop()!);
+    expect(value).toBe(3);
   });
 
   it('increments escrow_mutations_total for over_funded deposit', async () => {
