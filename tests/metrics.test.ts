@@ -76,12 +76,11 @@ describe('Prometheus metrics', () => {
     }
     const res = await request(app).get('/metrics').set('authorization', 'Bearer test-token');
     expect(res.status).toBe(200);
-    const value = metricValue(res.text, 'http_requests_total', {
-      method: 'GET',
-      route: '/api/v1/contracts/:id',
-      status: '404',
-    });
-    expect(value).toBe(3);
+    const line = res.text.split('\n').find((l) =>
+      l.includes('http_requests_total') && l.includes('method="GET"') && l.includes('route="/api/v1/contracts/:id"') && l.includes('status="404"')
+    );
+    expect(line).toBeDefined();
+    expect(parseFloat(line!.trim().split(/\s+/).pop()!)).toBe(3);
   });
 
   it('increments escrow_mutations_total for over_funded deposit', async () => {
