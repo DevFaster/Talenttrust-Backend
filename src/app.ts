@@ -175,33 +175,35 @@ export function createApp(store: EscrowStore = new EscrowStore().seed(), opts: {
     res.status(500).json({ error: 'internal_error', message: 'Unexpected error' });
   });
 
-  // /metrics is disabled (404) when METRICS_TOKEN is unset.
-  if (process.env.METRICS_TOKEN) {
-    const escrowContracts = registry.gauge('escrow_contracts', 'Escrow contracts by status', ['status']);
-    const escrowValueEscrowed = registry.gauge('escrow_value_escrowed', 'Value currently escrowed', []);
-    const escrowValueReleased = registry.gauge('escrow_value_released', 'Value released', []);
-    const processUptime = registry.gauge('process_uptime_seconds', 'Process uptime in seconds', []);
-    const nodejsHeapUsed = registry.gauge('nodejs_heap_used_bytes', 'Node.js heap used in bytes', []);
+  // /metrics is disabled (404) when METRICS_TOKEN is unset; checked at request time.
+  const escrowContracts = registry.gauge('escrow_contracts', 'Escrow contracts by status', ['status']);
+  const escrowValueEscrowed = registry.gauge('escrow_value_escrowed', 'Value currently escrowed', []);
+  const escrowValueReleased = registry.gauge('escrow_value_released', 'Value released', []);
+  const processUptime = registry.gauge('process_uptime_seconds', 'Process uptime in seconds', []);
+  const nodejsHeapUsed = registry.gauge('nodejs_heap_used_bytes', 'Node.js heap used in bytes', []);
 
-    app.get('/metrics', (req, res) => {
-      const auth = req.headers['authorization'];
-      const provided = Array.isArray(auth) ? auth[0] : auth;
-      const expected = 'Bearer ' + process.env.METRICS_TOKEN!;
-      if (!provided || !constantTimeEqual(provided, expected)) {
-        res.status(401).json({ error: 'unauthorized', message: 'Invalid metrics token' });
-        return;
-      }
-      const stats = store.stats();
-      for (const [status, count] of Object.entries(stats.byStatus)) {
-        escrowContracts.set({ status }, count);
-      }
-      escrowValueEscrowed.set({}, stats.totalEscrowed);
-      escrowValueReleased.set({}, stats.totalReleased);
-      processUptime.set({}, process.uptime());
-      nodejsHeapUsed.set({}, process.memoryUsage().heapUsed);
-      res.type('text/plain; version=0.0.4').send(registry.exposition());
-    });
-  }
+  app.get('/metrics', (req, res) => {
+    if (!process.env.METRICS_TOKEN) {
+      res.status(404).json({ error: 'not_found', message: 'Metrics endpoint disabled' });
+      return;
+    }
+    const auth = req.headers['authorization'];
+    const provided = Array.isArray(auth) ? auth[0] : auth;
+    const expected = 'Bearer ' + process.env.METRICS_TOKEN!;
+    if (!provided || !constantTimeEqual(provided, expected)) {
+      res.status(401).json({ error: 'unauthorized', message: 'Invalid metrics token' });
+      return;
+    }
+    const stats = store.stats();
+    for (const [status, count] of Object.entries(stats.byStatus)) {
+      escrowContracts.set({ status }, count);
+    }
+    escrowValueEscrowed.set({}, stats.totalEscrowed);
+    escrowValueReleased.set({}, stats.totalReleased);
+    processUptime.set({}, process.uptime());
+    nodejsHeapUsed.set({}, process.memoryUsage().heapUsed);
+    res.type('text/plain; version=0.0.4').send(registry.exposition());
+  });
 
   return app;
 }
