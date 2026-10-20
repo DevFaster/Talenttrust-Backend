@@ -35,7 +35,7 @@ describe('structured request logging', () => {
       .get('/api/v1/contracts/1')
       .set('x-request-id', 'valid-req-0001');
     expect(res.status).toBe(200);
-    expect(res.headers['x-request-id']).toBe('valid-req-0001');
+    expect(getResponseHeader(res, 'x-request-id')).toBe('valid-req-0001');
     expect(lines.some((l) => l.level === 'info' && l.msg === 'request')).toBe(true);
   });
 
@@ -46,9 +46,9 @@ describe('structured request logging', () => {
       const app = createApp({ store: new EscrowStore().seed(), logger });
       const res = await request(app).get('/api/v1/contracts/1').set('x-request-id', input);
       expect(res.status).toBe(200);
-      const echoed = res.headers['x-request-id'];
+      const echoed = getResponseHeader(res, 'x-request-id');
       expect(echoed).not.toBe(input);
-      expect(/^[A-Za-z0-9._-]{8,128}$/.test(echoed as string)).toBe(true);
+      expect(/^[A-Za-z0-9._-]{8,128}$/.test(echoed)).toBe(true);
       // no CR/LF ever reaches logs or headers
       for (const line of lines) {
         expect(String(line)).not.toMatch(/\r|\n/);
@@ -58,12 +58,12 @@ describe('structured request logging', () => {
 
   it('includes requestId in 404 and 400 error bodies', async () => {
     const { logger, lines } = captureLogger();
-    const app = createApp({ store: new EscrowStore(), logger });
+    const app = createApp({ store: new EscrowStore().seed(), logger });
 
     const notFound = await request(app).get('/api/v1/contracts/99999').set('x-request-id', 'notfound-req-0001');
     expect(notFound.status).toBe(404);
     expect((notFound.body as { requestId?: string }).requestId).toBe('notfound-req-0001');
-    expect(notFound.headers['x-request-id']).toBe('notfound-req-0001');
+    expect(getResponseHeader(notFound, 'x-request-id')).toBe('notfound-req-0001');
 
     const bad = await request(app)
       .post('/api/v1/contracts')
@@ -71,7 +71,7 @@ describe('structured request logging', () => {
       .set('x-request-id', 'badreq-0001');
     expect(bad.status).toBe(400);
     expect((bad.body as { requestId?: string }).requestId).toBe('badreq-0001');
-    expect(bad.headers['x-request-id']).toBe('badreq-0001');
+    expect(getResponseHeader(bad, 'x-request-id')).toBe('badreq-0001');
   });
 
   it('logs a throwing route with stack and matching requestId exactly once', async () => {
@@ -80,7 +80,7 @@ describe('structured request logging', () => {
     const res = await request(app).get('/api/v1/contracts/999').set('x-request-id', 'throw-req-0001');
     expect(res.status).toBe(500);
     expect((res.body as { requestId?: string }).requestId).toBe('throw-req-0001');
-    expect(res.headers['x-request-id']).toBe('throw-req-0001');
+    expect(getResponseHeader(res, 'x-request-id')).toBe('throw-req-0001');
 
     const errorLines = lines.filter(
       (l) => l.level === 'error' && l.msg === 'unhandled_error' && l.err && (l.err as { stack?: unknown }).stack,
@@ -123,4 +123,18 @@ describe('structured request logging', () => {
     await request(app).get('/api/v1/contracts/1');
     expect(lines.length).toBe(0);
   });
+
+  function getResponseHeader(res: { headers: Record<string, string | string[]>; rawHeaders?: string[] }, name: string): string | undefined {
+    const lower = name.toLowerCase();
+    if (res.headers && res.headers[lower] !== undefined) {
+      const v = res.headers[lower];
+      return Array.isArray(v) ? v[0] : v;
+    }
+    if (res.rawHeaders) {
+      for (let i = 0; i < res.rawHeaders.length; i += 2) {
+        if (res.rawHeaders[i].toLowerCase() === lower) return res.rawHeaders[i + 1];
+      }
+    }
+    return undefined;
+  }
 });
