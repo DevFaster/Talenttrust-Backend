@@ -158,23 +158,6 @@ export function createApp(store: EscrowStore = new EscrowStore().seed(), opts: {
   v1.get('/reputation/:address', wrap((req) => store.getReputation(req.params.address)));
   app.use('/api/v1', v1);
 
-  app.use((req, res) => {
-    res.status(404).json({ error: 'not_found', message: `No route for ${req.method} ${req.path}`, docs: '/docs' });
-  });
-
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-    if (err instanceof HttpError) {
-      res.status(err.status).json({ error: err.code, message: err.message });
-      return;
-    }
-    if (err && typeof err === 'object' && (err as { type?: string }).type === 'entity.parse.failed') {
-      res.status(400).json({ error: 'invalid_json', message: 'Malformed JSON body' });
-      return;
-    }
-    res.status(500).json({ error: 'internal_error', message: 'Unexpected error' });
-  });
-
   // /metrics is disabled (404) when METRICS_TOKEN is unset; checked at request time.
   const escrowContracts = registry.gauge('escrow_contracts', 'Escrow contracts by status', ['status']);
   const escrowValueEscrowed = registry.gauge('escrow_value_escrowed', 'Value currently escrowed', []);
@@ -203,6 +186,23 @@ export function createApp(store: EscrowStore = new EscrowStore().seed(), opts: {
     processUptime.set({}, process.uptime());
     nodejsHeapUsed.set({}, process.memoryUsage().heapUsed);
     res.type('text/plain; version=0.0.4').send(registry.exposition());
+  });
+
+  app.use((req, res) => {
+    res.status(404).json({ error: 'not_found', message: `No route for ${req.method} ${req.path}`, docs: '/docs' });
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (err instanceof HttpError) {
+      res.status(err.status).json({ error: err.code, message: err.message });
+      return;
+    }
+    if (err && typeof err === 'object' && (err as { type?: string }).type === 'entity.parse.failed') {
+      res.status(400).json({ error: 'invalid_json', message: 'Malformed JSON body' });
+      return;
+    }
+    res.status(500).json({ error: 'internal_error', message: 'Unexpected error' });
   });
 
   return app;
