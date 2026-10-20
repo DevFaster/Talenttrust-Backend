@@ -48,7 +48,7 @@ describe('structured request logging', () => {
       expect(res.status).toBe(200);
       const echoed = getResponseHeader(res, 'x-request-id');
       expect(echoed).not.toBe(input);
-      expect(/^[A-Za-z0-9._-]{8,128}$/.test(echoed)).toBe(true);
+      expect(/^[A-Za-z0-9._-]{8,128}$/.test(echoed as string)).toBe(true);
       // no CR/LF ever reaches logs or headers
       for (const line of lines) {
         expect(String(line)).not.toMatch(/\r|\n/);
