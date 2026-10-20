@@ -3,6 +3,20 @@ import { createApp } from '../src/app';
 import { EscrowStore, type EscrowContract } from '../src/store';
 import { createLogger, type Logger } from '../src/logger';
 
+function getResponseHeader(res: { headers: Record<string, string | string[]>; rawHeaders?: string[] }, name: string): string | undefined {
+  const lower = name.toLowerCase();
+  if (res.headers && res.headers[lower] !== undefined) {
+    const v = res.headers[lower];
+    return Array.isArray(v) ? v[0] : v;
+  }
+  if (res.rawHeaders) {
+    for (let i = 0; i < res.rawHeaders.length; i += 2) {
+      if (res.rawHeaders[i].toLowerCase() === lower) return res.rawHeaders[i + 1];
+    }
+  }
+  return undefined;
+}
+
 function captureLogger(): { logger: Logger; lines: Record<string, unknown>[] } {
   const lines: Record<string, unknown>[] = [];
   const logger = createLogger({
@@ -123,18 +137,4 @@ describe('structured request logging', () => {
     await request(app).get('/api/v1/contracts/1');
     expect(lines.length).toBe(0);
   });
-
-  function getResponseHeader(res: { headers: Record<string, string | string[]>; rawHeaders?: string[] }, name: string): string | undefined {
-    const lower = name.toLowerCase();
-    if (res.headers && res.headers[lower] !== undefined) {
-      const v = res.headers[lower];
-      return Array.isArray(v) ? v[0] : v;
-    }
-    if (res.rawHeaders) {
-      for (let i = 0; i < res.rawHeaders.length; i += 2) {
-        if (res.rawHeaders[i].toLowerCase() === lower) return res.rawHeaders[i + 1];
-      }
-    }
-    return undefined;
-  }
 });
