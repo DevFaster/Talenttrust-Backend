@@ -1,9 +1,11 @@
 import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import { createHmac, randomBytes } from 'node:crypto';
 import { config, explorerUrl } from './config';
 import { EscrowStore, HttpError } from './store';
 import { openapi, docsHtml } from './openapi';
+import { createLogger, type Logger, randomUUID } from './logger';
 import {
   createRegistry,
   type Registry,
@@ -11,7 +13,36 @@ import {
   constantTimeEqual,
 } from './metrics';
 
+declare global {
+  namespace Express {
+    interface Request {
+      id?: string;
+    }
+  }
+}
+
 const startedAt = Date.now();
+
+type LoggerLevel = 'debug' | 'info' | 'warn' | 'error';
+
+const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
+
+const CURSOR_SECRET = process.env.CURSOR_SECRET || randomBytes(32).toString('base64url');
+
+function resolveStoreAndLogger(
+  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore } = new EscrowStore().seed(),
+): { store: EscrowStore; logger: Logger } {
+  if (
+    storeOrOpts &&
+    typeof storeOrOpts === 'object' &&
+    'list' in storeOrOpts &&
+    typeof (storeOrOpts as EscrowStore).list === 'function'
+  ) {
+    return { store: storeOrOpts as EscrowStore, logger: createLogger() };
+  }
+  const opts = (storeOrOpts as { logger?: Logger; store?: EscrowStore } | undefined) ?? {};
+  return { store: opts.store ?? new EscrowStore().seed(), logger: opts.logger ?? createLogger() };
+}
 
 type Handler = (req: Request, res: Response) => unknown;
 const wrap = (fn: Handler) => (req: Request, res: Response, next: NextFunction) => {
@@ -29,7 +60,11 @@ const id = (req: Request) => {
   return n;
 };
 
-export function createApp(store: EscrowStore = new EscrowStore().seed(), opts: { registry?: Registry } = {}) {
+export function createApp(
+  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore } = new EscrowStore().seed(),
+  opts: { registry?: Registry } = {},
+) {
+  const { store, logger } = resolveStoreAndLogger(storeOrOpts);
   const registry = opts.registry ?? createRegistry();
   const app = express();
   app.disable('x-powered-by');
@@ -37,8 +72,18 @@ export function createApp(store: EscrowStore = new EscrowStore().seed(), opts: {
   app.use(cors());
   app.use(express.json({ limit: '100kb' }));
 
+  // Correlation id: echo a valid inbound X-Request-Id, otherwise generate one.
+  // The regex excludes CR/LF so a client cannot inject log-line terminators.
+  app.use((req, res, next) => {
+    const incoming = req.headers['x-request-id'];
+    const value = Array.isArray(incoming) ? incoming[0] : incoming;
+    const requestId = value && REQUEST_ID_RE.test(value) ? (value as string) : randomUUID();
+    req.id = requestId;
+    res.set('X-Request-Id', requestId);
+    next();
+  });
+
   // HTTP RED metrics: request counter and latency histogram.
-  // Route uses the Express route pattern (bounded cardinality), never raw path ids.
   const httpRequestsTotal = registry.counter(
     'http_requests_total',
     'Total number of HTTP requests',
@@ -58,6 +103,27 @@ export function createApp(store: EscrowStore = new EscrowStore().seed(), opts: {
       const route = req.route ? String(req.baseUrl || '') + String(req.route.path || '') : 'unmatched';
       httpRequestsTotal.inc({ method: req.method, route, status: String(res.statusCode) });
       httpRequestDuration.observe({ method: req.method, route }, durationSeconds);
+    });
+    next();
+  });
+
+  // Structured access log on response finish.
+  app.use((req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => {
+      const durationMs = Date.now() - start;
+      const route = req.route ? String(req.baseUrl || '') + String(req.route.path || '') : 'unmatched';
+      let level: LoggerLevel = 'info';
+      if (res.statusCode >= 500) level = 'error';
+      else if (res.statusCode >= 429) level = 'warn';
+      logger[level]('request', {
+        method: req.method,
+        path: route,
+        status: res.statusCode,
+        durationMs,
+        contentLength: res.get('content-length') ?? undefined,
+        ip: req.ip,
+      });
     });
     next();
   });
@@ -100,16 +166,19 @@ export function createApp(store: EscrowStore = new EscrowStore().seed(), opts: {
     })),
   );
 
-  app.get(
-    '/health',
-    wrap(() => ({
+  app.get('/health', (req, res) => {
+    if (app.get('draining')) {
+      res.status(503).setHeader('Connection', 'close').json({ status: 'draining' });
+      return;
+    }
+    res.json({
       status: 'ok',
       version: config.version,
       uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
       storage: 'in-memory',
       timestamp: new Date().toISOString(),
-    })),
-  );
+    });
+  });
 
   app.get('/openapi.json', wrap(() => openapi));
   app.get(['/docs', '/docs/'], (_req, res) => {
@@ -189,20 +258,29 @@ export function createApp(store: EscrowStore = new EscrowStore().seed(), opts: {
   });
 
   app.use((req, res) => {
-    res.status(404).json({ error: 'not_found', message: `No route for ${req.method} ${req.path}`, docs: '/docs' });
+    res.status(404).json({ error: 'not_found', message: `No route for ${req.method} ${req.path}`, requestId: req.id, docs: '/docs' });
   });
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+    const requestId = req.id;
     if (err instanceof HttpError) {
-      res.status(err.status).json({ error: err.code, message: err.message });
+      res.status(err.status).json({ error: err.code, message: err.message, requestId });
       return;
     }
     if (err && typeof err === 'object' && (err as { type?: string }).type === 'entity.parse.failed') {
-      res.status(400).json({ error: 'invalid_json', message: 'Malformed JSON body' });
+      res.status(400).json({ error: 'invalid_json', message: 'Malformed JSON body', requestId });
       return;
     }
-    res.status(500).json({ error: 'internal_error', message: 'Unexpected error' });
+    logger.error('unhandled_error', {
+      requestId,
+      err: {
+        name: (err as Error)?.name ?? 'Error',
+        message: (err as Error)?.message ?? String(err),
+        stack: (err as Error)?.stack,
+      },
+    });
+    res.status(500).json({ error: 'internal_error', message: 'Unexpected error', requestId });
   });
 
   return app;
