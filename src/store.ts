@@ -314,8 +314,8 @@ export class EscrowStore {
 
   resolveDispute(id: number, freelancerBpsRaw: unknown): EscrowContract {
     const c = this.get(id);
-    if (c.status !== 'Disputed') {
-      throw new HttpError(409, 'invalid_status', 'Only disputed contracts can be resolved');
+    if (c.status !== 'Disputed' || !c.dispute) {
+      throw new HttpError(409, 'invalid_status', 'Contract is not disputed');
     }
     const bps = Number(freelancerBpsRaw);
     if (!Number.isInteger(bps) || bps < 0 || bps > 10000) {
@@ -686,4 +686,3 @@ function isAfterCursor(c: EscrowContract, after: Cursor, field: string, desc: bo
   if (cmp !== 0) return desc ? cmp < 0 : cmp > 0;
   return desc ? c.id < after.lastId : c.id > after.lastId;
 }
-
