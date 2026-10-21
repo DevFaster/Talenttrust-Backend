@@ -26,7 +26,7 @@ data is per-instance and resets on redeploy.
 | GET | `/openapi.json` | OpenAPI 3 spec |
 | GET | `/api/v1/chain` | On-chain contract deployment info |
 | GET | `/api/v1/stats` | Aggregate statistics |
-| GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`, `?role=`, `?token=`, `?sort=`, `?limit=`, `?cursor=`) / create escrow contracts; responses include `{ data, page: { limit, nextCursor, hasMore } }` |
+| GET/POST | `/api/v1/contracts` | List (`?status=`, `?party=`, `?role=`, `?token=`, `?sort=`, `?limit=`, `?cursor=`, `?linked=`) / create escrow contracts; responses include `{ data, page: { limit, nextCursor, hasMore } }` |
 | GET | `/api/v1/contracts/:id` | Get a contract |
 | POST | `/api/v1/contracts/:id/deposit` | `{ "amount": 100 }` |
 | POST | `/api/v1/contracts/:id/milestones/:index/release` | Release a milestone |
@@ -34,6 +34,8 @@ data is per-instance and resets on redeploy.
 | POST | `/api/v1/contracts/:id/resolve` | `{ "freelancerBps": 5000 }` |
 | POST | `/api/v1/contracts/:id/cancel` | Cancel and refund |
 | POST | `/api/v1/contracts/:id/reputation` | `{ "rating": 5 }` |
+| POST | `/api/v1/contracts/:id/link` | Link to on-chain escrow `{ "escrowId": "3" }` |
+| GET | `/api/v1/contracts/:id/parity` | Parity check report against on-chain state |
 | GET | `/api/v1/reputation/:address` | Freelancer reputation |
 
 ## Development
