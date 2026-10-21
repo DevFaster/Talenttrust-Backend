@@ -12,7 +12,29 @@ export type ContractStatus =
   | 'Resolved'
   | 'Cancelled';
 
-export type MutationAction = 'create' | 'deposit' | 'release' | 'dispute' | 'resolve' | 'cancel' | 'rate';
+export type SortSpec =
+  | 'createdAt'
+  | '-createdAt'
+  | 'updatedAt'
+  | '-updatedAt'
+  | 'totalAmount'
+  | '-totalAmount';
+
+export interface Cursor {
+  sort: string;
+  lastValue: string;
+  lastId: number;
+}
+
+export interface QueryFilters {
+  status?: string[];
+  party?: string;
+  role?: 'client' | 'freelancer';
+  token?: string;
+  createdAfter?: string;
+  createdBefore?: string;
+  linked?: boolean;
+}
 
 export interface Milestone {
   index: number;
@@ -86,15 +108,6 @@ export class EscrowStore {
   private contracts = new Map<number, EscrowContract>();
   private reputation = new Map<string, { completed: number; total: number }>();
   private nextId = 1;
-  private mutationRecorder?: (action: MutationAction, result: string) => void;
-
-  setMutationRecorder(fn: (action: MutationAction, result: string) => void): void {
-    this.mutationRecorder = fn;
-  }
-
-  private record(action: MutationAction, result: string): void {
-    this.mutationRecorder?.(action, result);
-  }
 
   list(filter: { status?: string; party?: string; linked?: boolean } = {}): EscrowContract[] {
     return [...this.contracts.values()].filter(
@@ -103,6 +116,32 @@ export class EscrowStore {
         (!filter.party || c.client === filter.party || c.freelancer === filter.party) &&
         (filter.linked === undefined || (filter.linked ? !!c.chain : !c.chain)),
     );
+  }
+
+  query(opts: {
+    filters?: QueryFilters;
+    sort?: string;
+    limit?: number;
+    after?: Cursor;
+  }): { data: EscrowContract[]; hasMore: boolean; nextCursor: Cursor | null } {
+    const limit = opts.limit ?? 20;
+    const sort = opts.sort ?? '-createdAt';
+    const { field, desc } = parseSort(sort);
+    let items = [...this.contracts.values()].filter((c) => matchesFilters(c, opts.filters));
+    items.sort((a, b) => compareContracts(a, b, field, desc));
+    const after = opts.after;
+    if (after) {
+      items = items.filter((c) => isAfterCursor(c, after, field, desc));
+    }
+    const raw = items.slice(0, limit + 1);
+    const hasMore = raw.length > limit;
+    const data = hasMore ? raw.slice(0, limit) : raw;
+    let nextCursor: Cursor | null = null;
+    if (hasMore) {
+      const last = data[data.length - 1];
+      nextCursor = { sort, lastValue: String(sortValue(last, field)), lastId: last.id };
+    }
+    return { data, hasMore, nextCursor };
   }
 
   get(id: number): EscrowContract {
@@ -118,9 +157,7 @@ export class EscrowStore {
     token?: unknown;
     milestones?: unknown;
   }): EscrowContract {
-    const action: MutationAction = 'create';
-    try {
-      const { client, freelancer } = input;
+    const { client, freelancer } = input;
     if (typeof client !== 'string' || typeof freelancer !== 'string' || !client || !freelancer) {
       throw new HttpError(400, 'invalid_parties', 'client and freelancer are required strings');
     }
@@ -178,12 +215,7 @@ export class EscrowStore {
       updatedAt: now,
     };
     this.contracts.set(c.id, c);
-    this.record(action, 'ok');
     return c;
-    } catch (err) {
-      if (err instanceof HttpError) this.record(action, err.code);
-      throw err;
-    }
   }
 
   private requireActive(c: EscrowContract) {
@@ -198,9 +230,7 @@ export class EscrowStore {
   }
 
   deposit(id: number, amountRaw: unknown): EscrowContract {
-    const action: MutationAction = 'deposit';
-    try {
-      const c = this.get(id);
+    const c = this.get(id);
     this.requireActive(c);
     const isBig =
       typeof c.totalAmount === 'string' ||
@@ -235,18 +265,11 @@ export class EscrowStore {
     }
     c.fundedAmount = Number(c.fundedAmount) + amount;
     if (c.fundedAmount === c.totalAmount) c.status = 'Funded';
-    this.record(action, 'ok');
     return this.touch(c);
-    } catch (err) {
-      if (err instanceof HttpError) this.record(action, err.code);
-      throw err;
-    }
   }
 
   release(id: number, index: number): EscrowContract {
-    const action: MutationAction = 'release';
-    try {
-      const c = this.get(id);
+    const c = this.get(id);
     this.requireActive(c);
     const m = c.milestones[index];
     if (!m) throw new HttpError(404, 'milestone_not_found', `Milestone ${index} not found`);
@@ -271,18 +294,11 @@ export class EscrowStore {
     m.released = true;
     c.releasedAmount = Number(c.releasedAmount) + Number(m.amount);
     if (c.milestones.every((x) => x.released)) c.status = 'Completed';
-    this.record(action, 'ok');
     return this.touch(c);
-    } catch (err) {
-      if (err instanceof HttpError) this.record(action, err.code);
-      throw err;
-    }
   }
 
   openDispute(id: number, raisedBy: unknown, reason: unknown): EscrowContract {
-    const action: MutationAction = 'dispute';
-    try {
-      const c = this.get(id);
+    const c = this.get(id);
     if (raisedBy !== c.client && raisedBy !== c.freelancer) {
       throw new HttpError(403, 'unauthorized', 'Only the client or freelancer can open a dispute');
     }
@@ -293,25 +309,13 @@ export class EscrowStore {
       reason: typeof reason === 'string' && reason ? reason : 'No reason given',
       openedAt: new Date().toISOString(),
     };
-    this.record(action, 'ok');
     return this.touch(c);
-    } catch (err) {
-      if (err instanceof HttpError) this.record(action, err.code);
-      throw err;
-    }
   }
 
   resolveDispute(id: number, freelancerBpsRaw: unknown): EscrowContract {
-    const action: MutationAction = 'resolve';
-    try {
-      const c = this.get(id);
-      if (c.status !== 'Disputed' || !c.dispute) {
-        throw new HttpError(409, 'invalid_status', 'Contract is not disputed');
-      }
-    } catch (err) {
-      if (err instanceof HttpError) this.record(action, err.code);
-      throw err;
-    }
+    const c = this.get(id);
+    if (c.status !== 'Disputed' || !c.dispute) {
+      throw new HttpError(409, 'invalid_status', 'Contract is not disputed');
     }
     const bps = Number(freelancerBpsRaw);
     if (!Number.isInteger(bps) || bps < 0 || bps > 10000) {
@@ -325,32 +329,18 @@ export class EscrowStore {
       c.dispute.freelancerBps = bps;
       c.dispute.resolvedAt = new Date().toISOString();
     }
-    this.record(action, 'ok');
     return this.touch(c);
-    } catch (err) {
-      if (err instanceof HttpError) this.record(action, err.code);
-      throw err;
-    }
   }
 
   cancel(id: number): EscrowContract {
-    const action: MutationAction = 'cancel';
-    try {
-      const c = this.get(id);
+    const c = this.get(id);
     this.requireActive(c);
     c.status = 'Cancelled';
-    this.record(action, 'ok');
     return this.touch(c);
-    } catch (err) {
-      if (err instanceof HttpError) this.record(action, err.code);
-      throw err;
-    }
   }
 
   rate(id: number, ratingRaw: unknown): Reputation {
-    const action: MutationAction = 'rate';
-    try {
-      const c = this.get(id);
+    const c = this.get(id);
     if (c.status !== 'Completed') {
       throw new HttpError(409, 'invalid_status', 'Only completed contracts can issue reputation');
     }
@@ -367,12 +357,7 @@ export class EscrowStore {
     this.reputation.set(c.freelancer, r);
     c.reputationIssued = true;
     this.touch(c);
-    this.record(action, 'ok');
     return this.getReputation(c.freelancer);
-    } catch (err) {
-      if (err instanceof HttpError) this.record(action, err.code);
-      throw err;
-    }
   }
 
   async linkEscrow(
@@ -643,4 +628,61 @@ export class EscrowStore {
     this.rate(b.id, 5);
     return this;
   }
+}
+
+const VALID_STATUSES: ContractStatus[] = ['Created', 'Funded', 'Completed', 'Disputed', 'Resolved', 'Cancelled'];
+const SORT_FIELDS = ['createdAt', 'updatedAt', 'totalAmount'] as const;
+
+function parseSort(sort: string): { field: string; desc: boolean } {
+  const desc = sort.startsWith('-');
+  const field = desc ? sort.slice(1) : sort;
+  if (!SORT_FIELDS.includes(field as never)) {
+    throw new HttpError(400, 'invalid_query', 'invalid sort');
+  }
+  return { field, desc };
+}
+
+function sortValue(c: EscrowContract, field: string): string | number {
+  if (field === 'totalAmount') return c.totalAmount;
+  return c[field as 'createdAt' | 'updatedAt'];
+}
+
+function compareValue(va: string | number, vb: string | number): number {
+  if (typeof va === 'number' && typeof vb === 'number') {
+    if (va < vb) return -1;
+    if (va > vb) return 1;
+    return 0;
+  }
+  return String(va).localeCompare(String(vb));
+}
+
+function compareContracts(a: EscrowContract, b: EscrowContract, field: string, desc: boolean): number {
+  const cmp = compareValue(sortValue(a, field), sortValue(b, field));
+  if (cmp !== 0) return desc ? -cmp : cmp;
+  return a.id - b.id;
+}
+
+function matchesFilters(c: EscrowContract, f: QueryFilters | undefined): boolean {
+  if (!f) return true;
+  if (f.status && !f.status.includes(c.status)) return false;
+  if (f.party !== undefined) {
+    if (f.role === 'client') {
+      if (c.client !== f.party) return false;
+    } else if (f.role === 'freelancer') {
+      if (c.freelancer !== f.party) return false;
+    } else {
+      if (c.client !== f.party && c.freelancer !== f.party) return false;
+    }
+  }
+  if (f.token && c.token !== f.token) return false;
+  if (f.createdAfter && c.createdAt < f.createdAfter) return false;
+  if (f.createdBefore && c.createdAt > f.createdBefore) return false;
+  if (f.linked !== undefined && (!!c.chain !== f.linked)) return false;
+  return true;
+}
+
+function isAfterCursor(c: EscrowContract, after: Cursor, field: string, desc: boolean): boolean {
+  const cmp = compareValue(sortValue(c, field), after.lastValue);
+  if (cmp !== 0) return desc ? cmp < 0 : cmp > 0;
+  return desc ? c.id < after.lastId : c.id > after.lastId;
 }
