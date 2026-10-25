@@ -1,12 +1,37 @@
 import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import compression from 'compression';
 import { config, explorerUrl } from './config';
-import { EscrowStore, HttpError, type Cursor, type QueryFilters } from './store';
+import { EscrowStore, HttpError, LIST_STATUSES, type Cursor, type QueryFilters } from './store';
 import { openapi, docsHtml } from './openapi';
+import { validate } from './validation/middleware';
+import {
+  IdParam,
+  MilestoneIndexParam,
+  MilestoneReleaseParams,
+  CreateContractBody,
+  DepositBody,
+  DisputeBody,
+  ResolveBody,
+  RateBody,
+  CancelBody,
+  ListQuery,
+  ReputationAddressParam,
+} from './validation/schemas';
+import { parseFieldSpec, project } from './utils/project';
 import { createLogger, type Logger, randomUUID } from './logger';
 import { ChainReader, SorobanRpcChainReader } from './chain';
+import { buildEscrowTransaction, TxBuildError, type RpcClient } from './stellar/escrowTxBuilder';
+import { bigIntReplacer } from './amount';
+import { createRegistry, type Registry, HTTP_DURATION_BUCKETS, constantTimeEqual } from './metrics';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto';
+import { StrKey, Keypair } from '@stellar/stellar-sdk';
+import { randomBytes } from 'crypto';
+import { buildChallenge, verifyChallenge, consumeNonce } from './auth/challenge';
+import { issueWalletToken } from './auth/jwt';
+import { createRequireAuth, WalletAuthRequest } from './auth/middleware';
+import { ReceiptManager, hashContractState, verifyReceipt } from './receipts';
 
 declare global {
   namespace Express {
@@ -15,17 +40,22 @@ declare global {
     }
   }
 }
+import { idempotency, IdempotencyStore, MemoryIdempotencyStore } from './idempotency';
 
 const startedAt = Date.now();
 
-const CURSOR_SECRET = process.env.CURSOR_SECRET || randomBytes(32).toString('base64url');
 type LoggerLevel = 'debug' | 'info' | 'warn' | 'error';
 
 type Handler = (req: Request, res: Response) => unknown | Promise<unknown>;
 const wrap = (fn: Handler) => async (req: Request, res: Response, next: NextFunction) => {
   try {
     const out = await fn(req, res);
-    if (out !== undefined && !res.headersSent) res.json(out);
+    if (out !== undefined && !res.headersSent) {
+      // Use bigIntReplacer so bigint amounts serialise as decimal strings
+      // and JSON.stringify never throws on a response. Go through res.json so
+      // middleware that wraps it (idempotency replay) still sees the body.
+      res.json(JSON.parse(JSON.stringify(out, bigIntReplacer)));
+    }
   } catch (err) {
     next(err);
   }
@@ -37,11 +67,150 @@ const id = (req: Request) => {
   return n;
 };
 
+const optionalString = (v: unknown) => (typeof v === 'string' && v.length > 0 ? v : undefined);
+
+/**
+ * Parse the `?fields=` query param.  Returns `null` when the param is absent
+ * (meaning "return all fields").  Throws {@link HttpError} 400 on invalid input.
+ */
+function parseFields(req: Request) {
+  const raw = req.query.fields;
+  if (typeof raw !== 'string') return null;
+  return parseFieldSpec(raw);
+}
+
+/** Bearer check for the cron sweep; fails closed (404) when CRON_SECRET is unset. */
+const requireCronSecret = (req: Request) => {
+  const expected = process.env.CRON_SECRET;
+  if (!expected) throw new HttpError(404, 'not_found', 'Cron endpoint is not configured');
+  const supplied = req.get('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!supplied) throw new HttpError(401, 'cron_unauthorized', 'Valid bearer authorization is required');
+  // Compare fixed-length digests so the comparison is constant-time and length-independent.
+  const expectedBytes = createHash('sha256').update(expected).digest();
+  const suppliedBytes = createHash('sha256').update(supplied).digest();
+  if (!timingSafeEqual(expectedBytes, suppliedBytes)) {
+    throw new HttpError(401, 'cron_unauthorized', 'Valid bearer authorization is required');
+  }
+};
+
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
 
+// --- Contract list pagination (cursor = base64url JSON + HMAC, so clients cannot forge it) ---
+
+const CURSOR_SECRET = process.env.CURSOR_SECRET || randomBytes(32).toString('base64url');
+
+function safeEqual(a: string, b: string): boolean {
+  const ba = Buffer.from(a, 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  return ba.length === bb.length && timingSafeEqual(ba, bb);
+}
+
+function parseLimit(v: unknown): number {
+  if (v === undefined) return 20;
+  const n = Number(v);
+  if (typeof v !== 'string' || !Number.isInteger(n) || n < 1 || n > 100) {
+    throw new HttpError(400, 'invalid_query', 'limit must be an integer between 1 and 100');
+  }
+  return n;
+}
+
+function parseSortParam(v: unknown): string {
+  if (v === undefined) return '-createdAt';
+  const s = String(v);
+  const field = s.startsWith('-') ? s.slice(1) : s;
+  if (!['createdAt', 'updatedAt', 'totalAmount'].includes(field)) {
+    throw new HttpError(400, 'invalid_query', 'sort must be one of createdAt, updatedAt, totalAmount (prefix - for descending)');
+  }
+  return s;
+}
+
+function serializeCursor(cursor: Cursor): string {
+  const payload = Buffer.from(JSON.stringify(cursor)).toString('base64url');
+  const sig = createHmac('sha256', CURSOR_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function parseCursorParam(cursor: unknown, sort: string): Cursor | undefined {
+  if (cursor === undefined || cursor === '') return undefined;
+  const parts = String(cursor).split('.');
+  if (parts.length !== 2) throw new HttpError(400, 'invalid_cursor', 'invalid cursor');
+  const [payload, sig] = parts;
+  const expected = createHmac('sha256', CURSOR_SECRET).update(payload).digest('base64url');
+  if (!safeEqual(sig, expected)) throw new HttpError(400, 'invalid_cursor', 'invalid cursor');
+  let obj: { sort?: unknown; lastValue?: unknown; lastId?: unknown };
+  try {
+    obj = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+  } catch {
+    throw new HttpError(400, 'invalid_cursor', 'invalid cursor');
+  }
+  if (obj.sort !== sort) throw new HttpError(400, 'invalid_cursor', 'cursor sort does not match requested sort');
+  return { sort, lastValue: String(obj.lastValue ?? ''), lastId: Number(obj.lastId ?? 0) };
+}
+
+function parseFilters(q: Request['query']): QueryFilters {
+  const f: QueryFilters = {};
+  if (typeof q.status === 'string') {
+    f.status = q.status.split(',').map((s) => s.trim()).filter(Boolean);
+    for (const status of f.status) {
+      if (!(LIST_STATUSES as string[]).includes(status)) throw new HttpError(400, 'invalid_query', `invalid status ${status}`);
+    }
+  }
+  if (typeof q.party === 'string') f.party = q.party;
+  if (typeof q.role === 'string') {
+    if (f.party === undefined) throw new HttpError(400, 'invalid_query', 'role requires party');
+    if (q.role !== 'client' && q.role !== 'freelancer') throw new HttpError(400, 'invalid_query', 'role must be client or freelancer');
+    f.role = q.role;
+  }
+  if (typeof q.token === 'string') f.token = q.token;
+  if (typeof q.createdAfter === 'string') f.createdAfter = q.createdAfter;
+  if (typeof q.createdBefore === 'string') f.createdBefore = q.createdBefore;
+  if (q.linked === 'true') f.linked = true;
+  else if (q.linked === 'false') f.linked = false;
+  return f;
+}
+
+/** Validate that a string is a valid Stellar ed25519 public key (G…). */
+function isValidStellarAddress(addr: unknown): addr is string {
+  return typeof addr === 'string' && StrKey.isValidEd25519PublicKey(addr);
+}
+
+/** Authenticated wallet address, if the request carried a valid bearer token. */
+const callerOf = (req: Request): string | undefined => (req as WalletAuthRequest).auth?.address;
+
+/** Dependencies that can be injected via createApp's first argument. */
+export type AppDeps = {
+  logger?: Logger;
+  store?: EscrowStore;
+  chainReader?: ChainReader;
+  txRpcServer?: RpcClient;
+  /** Secret for wallet-auth challenges and JWTs. Passing it enforces auth unless `authRequired: false`. */
+  authSecret?: string;
+  /** Force wallet auth on (true) or off (false) for mutating routes. */
+  authRequired?: boolean;
+  /** Injectable clock for auth (tests). */
+  now?: () => number;
+  /** Signs contract-state receipts; defaults to RECEIPT_SIGNING_SECRET or an ephemeral key. */
+  receiptManager?: ReceiptManager;
+  /** Prometheus registry; each app gets its own unless one is injected. */
+  registry?: Registry;
+};
+
+/**
+ * Wallet auth is enforced when a secret is configured (AUTH_SECRET or the
+ * `authSecret` dep) or AUTH_REQUIRED=true. Without a secret a random
+ * per-process one is used so the challenge/token flow still works, and
+ * unauthenticated requests keep the legacy behaviour.
+ */
+function resolveAuth(deps: AppDeps) {
+  const configured = deps.authSecret ?? process.env.AUTH_SECRET;
+  const secret = configured || randomBytes(32).toString('base64');
+  const required = deps.authRequired ?? (Boolean(configured) || process.env.AUTH_REQUIRED === 'true');
+  return { secret, required, now: deps.now ?? Date.now };
+}
+
 function resolveStoreAndLogger(
-  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
-): { store: EscrowStore; logger: Logger; chainReader: ChainReader } {
+  storeOrOpts: EscrowStore | AppDeps = new EscrowStore().seed(),
+): { store: EscrowStore; logger: Logger; chainReader: ChainReader; txRpcServer?: RpcClient } {
   if (
     storeOrOpts &&
     typeof storeOrOpts === 'object' &&
@@ -50,22 +219,42 @@ function resolveStoreAndLogger(
   ) {
     return { store: storeOrOpts as EscrowStore, logger: createLogger(), chainReader: new SorobanRpcChainReader() };
   }
-  const opts = (storeOrOpts as { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } | undefined) ?? {};
+  const opts = (storeOrOpts as AppDeps | undefined) ?? {};
   return {
     store: opts.store ?? new EscrowStore().seed(),
     logger: opts.logger ?? createLogger(),
     chainReader: opts.chainReader ?? new SorobanRpcChainReader(),
+    txRpcServer: opts.txRpcServer,
   };
 }
 
+export interface AppOptions {
+  idempotencyStore?: IdempotencyStore;
+  idempotencyRequired?: boolean;
+  receiptManager?: ReceiptManager;
+  registry?: Registry;
+}
+
 export function createApp(
-  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
-  fallbackChainReader?: ChainReader,
+  storeOrOpts: EscrowStore | AppDeps = new EscrowStore().seed(),
+  fallbackChainReaderOrReceiptManager?: ChainReader | ReceiptManager,
+  options: AppOptions = {},
 ) {
   const resolved = resolveStoreAndLogger(storeOrOpts);
   const store = resolved.store;
   const logger = resolved.logger;
-  const chainReader = fallbackChainReader ?? resolved.chainReader;
+  const second = fallbackChainReaderOrReceiptManager;
+  const chainReader = second instanceof ReceiptManager ? resolved.chainReader : (second ?? resolved.chainReader);
+  const txRpcServer = resolved.txRpcServer;
+  const isDeps = !(storeOrOpts && typeof (storeOrOpts as EscrowStore).list === 'function');
+  const deps: AppDeps = isDeps ? ((storeOrOpts as AppDeps | undefined) ?? {}) : {};
+  const auth = resolveAuth(deps);
+  // Created lazily so apps that never sign receipts don't generate a key (or warn).
+  let receiptManagerInstance: ReceiptManager | undefined =
+    second instanceof ReceiptManager ? second : (options.receiptManager ?? deps.receiptManager);
+  const receiptManager = () =>
+    (receiptManagerInstance ??= new ReceiptManager(process.env.RECEIPT_SIGNING_SECRET));
+  const requireAuth = createRequireAuth(auth.secret, auth.now, auth.required);
 
   const app = express();
   app.disable('x-powered-by');
@@ -80,8 +269,56 @@ export function createApp(
     next();
   });
 
+  // HTTP RED metrics: request counter and latency histogram, labelled by route pattern.
+  const registry = options.registry ?? deps.registry ?? createRegistry();
+  const httpRequestsTotal = registry.counter('http_requests_total', 'Total number of HTTP requests', [
+    'method',
+    'route',
+    'status',
+  ]);
+  const httpRequestDuration = registry.histogram(
+    'http_request_duration_seconds',
+    'HTTP request duration in seconds',
+    ['method', 'route'],
+    HTTP_DURATION_BUCKETS,
+  );
+  app.use((req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => {
+      const route = req.route ? String(req.baseUrl || '') + String(req.route.path || '') : 'unmatched';
+      httpRequestsTotal.inc({ method: req.method, route, status: String(res.statusCode) });
+      httpRequestDuration.observe({ method: req.method, route }, (Date.now() - start) / 1000);
+    });
+    next();
+  });
+
+  // Domain mutation counter, incremented from the store layer.
+  const escrowMutationsTotal = registry.counter('escrow_mutations_total', 'Total number of escrow mutations', [
+    'action',
+    'result',
+  ]);
+  store.setMutationRecorder((action, result) => escrowMutationsTotal.inc({ action, result }));
+
   app.use(helmet({ contentSecurityPolicy: false }));
   app.use(cors());
+
+  // Compression middleware: gzip/br for JSON responses ≥ 1 KB.
+  // Excluded for text/event-stream and when Cache-Control: no-transform is set.
+  app.use(
+    compression({
+      threshold: 1024, // bytes — skip compression for small responses
+      filter(req, res) {
+        // Honour Cache-Control: no-transform (RFC 7234 §5.2.1.6)
+        const cc = res.getHeader('Cache-Control');
+        if (typeof cc === 'string' && cc.includes('no-transform')) return false;
+        // Never compress streaming responses
+        const ct = res.getHeader('Content-Type');
+        if (typeof ct === 'string' && ct.includes('text/event-stream')) return false;
+        return compression.filter(req, res);
+      },
+    }),
+  );
+
   app.use(express.json({ limit: '100kb' }));
 
   // Structured access log on response finish.
@@ -105,6 +342,17 @@ export function createApp(
     next();
   });
 
+  const getOrigin = (req: Request) => `${req.protocol}://${req.get('host') || 'localhost'}`;
+
+  /** With `?receipt=true`, attach a `Receipt` header: a JWS over the post-mutation contract state. */
+  const maybeAttachReceipt = (req: Request, res: Response, contract: unknown) => {
+    if (req.query.receipt === 'true' && contract && typeof contract === 'object') {
+      res.setHeader('Receipt', receiptManager().issueReceipt(contract as Record<string, unknown>, getOrigin(req)));
+    }
+  };
+
+  app.get('/.well-known/talenttrust-receipts.json', wrap(() => receiptManager().getPublishedKeys()));
+
   app.get(
     '/',
     wrap(() => ({
@@ -119,20 +367,34 @@ export function createApp(
         'GET  /health',
         'GET  /docs',
         'GET  /openapi.json',
+        'GET  /metrics',
+        'GET  /.well-known/talenttrust-receipts.json',
         'GET  /api/v1/chain',
         'GET  /api/v1/stats',
+        'POST /api/v1/tx/build',
         'GET  /api/v1/contracts',
         'POST /api/v1/contracts',
         'GET  /api/v1/contracts/:id',
+        'GET  /api/v1/contracts/:id/receipt',
+        'PATCH /api/v1/contracts/:id',
+        'DELETE /api/v1/contracts/:id',
+        'GET  /api/v1/contracts/:id/revisions',
         'POST /api/v1/contracts/:id/deposit',
+        'POST /api/v1/contracts/:id/extend-deadline',
         'POST /api/v1/contracts/:id/milestones/:index/release',
         'POST /api/v1/contracts/:id/dispute',
         'POST /api/v1/contracts/:id/resolve',
         'POST /api/v1/contracts/:id/cancel',
         'POST /api/v1/contracts/:id/reputation',
+        'POST /api/v1/contracts/:id/reviews',
         'POST /api/v1/contracts/:id/link',
         'GET  /api/v1/contracts/:id/parity',
         'GET  /api/v1/reputation/:address',
+        'GET  /api/v1/reputation/:address/reviews',
+        'GET  /api/v1/auth/challenge',
+        'POST /api/v1/auth/token',
+        'POST /api/v1/receipts/verify',
+        'GET/POST /api/cron/expire-contracts',
       ],
     })),
   );
@@ -157,6 +419,61 @@ export function createApp(
   });
 
   const v1 = express.Router();
+  v1.use(
+    idempotency(options.idempotencyStore ?? new MemoryIdempotencyStore(), {
+      required: options.idempotencyRequired ?? process.env.IDEMPOTENCY_REQUIRED === 'true',
+    }),
+  );
+  // --- Wallet-signature auth (public) ---
+
+  // GET /api/v1/auth/challenge?address=G...
+  v1.get(
+    '/auth/challenge',
+    wrap((req) => {
+      const address = req.query.address;
+      if (!isValidStellarAddress(address)) {
+        throw new HttpError(400, 'invalid_address', 'address must be a valid Stellar G… public key');
+      }
+      const { challenge, expiresAt } = buildChallenge(address, auth.secret, auth.now);
+      return { address, challenge, expiresAt };
+    }),
+  );
+
+  // POST /api/v1/auth/token  { address, challenge, signature }
+  v1.post(
+    '/auth/token',
+    wrap((req) => {
+      const { address, challenge, signature } = req.body ?? {};
+      if (!isValidStellarAddress(address)) {
+        throw new HttpError(400, 'invalid_address', 'address must be a valid Stellar G… public key');
+      }
+      if (typeof challenge !== 'string' || !challenge) {
+        throw new HttpError(400, 'invalid_challenge', 'challenge is required');
+      }
+      if (typeof signature !== 'string' || !signature) {
+        throw new HttpError(400, 'invalid_signature', 'signature is required');
+      }
+
+      // Verify the challenge HMAC, expiry, address match, and replay.
+      const result = verifyChallenge(challenge, address, auth.secret, auth.now);
+      if (!result.ok) throw new HttpError(401, result.error, 'Challenge verification failed');
+
+      // Verify the ed25519 signature over the exact challenge string.
+      let sigValid = false;
+      try {
+        sigValid = Keypair.fromPublicKey(address).verify(Buffer.from(challenge, 'utf-8'), Buffer.from(signature, 'base64'));
+      } catch {
+        sigValid = false;
+      }
+      if (!sigValid) throw new HttpError(401, 'invalid_signature', 'Signature verification failed');
+
+      // Mark the nonce as consumed so the challenge can't be replayed in this process.
+      consumeNonce(result.payload.nonce);
+      const { token, expiresAt } = issueWalletToken(address, auth.secret, auth.now);
+      return { token, tokenType: 'Bearer', expiresAt };
+    }),
+  );
+
   v1.get(
     '/chain',
     wrap(() => ({
@@ -166,37 +483,169 @@ export function createApp(
       explorer: explorerUrl(),
     })),
   );
+  v1.post(
+    '/tx/build',
+    wrap(async (req) =>
+      buildEscrowTransaction(req.body, txRpcServer ? { server: txRpcServer } : {}),
+    ),
+  );
   v1.get('/stats', wrap(() => store.stats()));
   v1.get(
     '/contracts',
-    wrap((req, res) => {
+    validate({ query: ListQuery }),
+    wrap((req) => {
       const limit = parseLimit(req.query.limit);
       const sort = parseSortParam(req.query.sort);
       const after = parseCursorParam(req.query.cursor, sort);
       const filters = parseFilters(req.query);
+      const spec = parseFields(req);
       const result = store.query({ filters, sort, limit, after });
-      res.json({ data: result.data, page: { limit, nextCursor: result.nextCursor ? serializeCursor(result.nextCursor) : null, hasMore: result.hasMore } });
+      return {
+        data: result.data.map((c) => project(c, spec)),
+        page: { limit, nextCursor: result.nextCursor ? serializeCursor(result.nextCursor) : null, hasMore: result.hasMore },
+      };
     }),
   );
   v1.post(
     '/contracts',
+    requireAuth,
+    (req, _res, next) => {
+      // With wallet auth the client is the authenticated address: reject a
+      // different body.client and default it when omitted.
+      const caller = callerOf(req);
+      if (caller !== undefined) {
+        const body = req.body && typeof req.body === 'object' ? req.body : {};
+        if (body.client !== undefined && body.client !== caller) {
+          return next(new HttpError(403, 'forbidden', 'Authenticated address must match contract client'));
+        }
+        req.body = { ...body, client: caller };
+      }
+      next();
+    },
+    validate({ body: CreateContractBody }),
     wrap((req, res) => {
-      res.status(201).json(store.create(req.body ?? {}));
+      const created = store.create(req.body);
+      maybeAttachReceipt(req, res, created);
+      res.status(201).json(created);
     }),
   );
-  v1.get('/contracts/:id', wrap((req) => store.get(id(req))));
-  v1.post('/contracts/:id/deposit', wrap((req) => store.deposit(id(req), req.body?.amount)));
+  v1.get(
+    '/contracts/:id',
+    validate({ params: IdParam }),
+    wrap((req) => project(store.get(Number(req.params.id)), parseFields(req))),
+  );
+  v1.get(
+    '/contracts/:id/receipt',
+    wrap((req) => {
+      const contract = store.get(id(req));
+      return { receipt: receiptManager().issueReceipt(contract as unknown as Record<string, unknown>, getOrigin(req)) };
+    }),
+  );
+  // With wallet auth the authenticated address stands in for body.client.
+  const clientOf = (req: Request): unknown => {
+    const caller = callerOf(req);
+    if (caller === undefined) return req.body?.client;
+    if (req.body?.client !== undefined && req.body.client !== caller) {
+      throw new HttpError(403, 'forbidden', 'Authenticated address must match contract client');
+    }
+    return caller;
+  };
+  v1.patch(
+    '/contracts/:id',
+    requireAuth,
+    wrap((req) => store.edit(id(req), { ...(req.body ?? {}), client: clientOf(req) })),
+  );
+  v1.delete(
+    '/contracts/:id',
+    requireAuth,
+    wrap((req, res) => {
+      store.delete(id(req), clientOf(req));
+      res.status(204).end();
+    }),
+  );
+  v1.get('/contracts/:id/revisions', wrap((req) => store.getRevisions(id(req))));
+  v1.post(
+    '/contracts/:id/extend-deadline',
+    requireAuth,
+    wrap((req) => store.extendDeadline(id(req), clientOf(req), req.body?.fundingDeadline)),
+  );
+  v1.post(
+    '/contracts/:id/deposit',
+    requireAuth,
+    validate({ params: IdParam, body: DepositBody }),
+    wrap((req, res) => {
+      const updated = store.deposit(Number(req.params.id), req.body.amount, callerOf(req));
+      maybeAttachReceipt(req, res, updated);
+      return updated;
+    }),
+  );
   v1.post(
     '/contracts/:id/milestones/:index/release',
-    wrap((req) => store.release(id(req), Number(req.params.index))),
+    requireAuth,
+    validate({ params: MilestoneReleaseParams }),
+    wrap((req, res) => {
+      const updated = store.release(Number(req.params.id), Number(req.params.index), callerOf(req));
+      maybeAttachReceipt(req, res, updated);
+      return updated;
+    }),
   );
   v1.post(
     '/contracts/:id/dispute',
-    wrap((req) => store.openDispute(id(req), req.body?.raisedBy, req.body?.reason)),
+    requireAuth,
+    validate({ params: IdParam, body: DisputeBody }),
+    wrap((req, res) => {
+      const updated = store.openDispute(Number(req.params.id), req.body.raisedBy, req.body.reason, callerOf(req));
+      maybeAttachReceipt(req, res, updated);
+      return updated;
+    }),
   );
-  v1.post('/contracts/:id/resolve', wrap((req) => store.resolveDispute(id(req), req.body?.freelancerBps)));
-  v1.post('/contracts/:id/cancel', wrap((req) => store.cancel(id(req))));
-  v1.post('/contracts/:id/reputation', wrap((req) => store.rate(id(req), req.body?.rating)));
+  v1.post(
+    '/contracts/:id/resolve',
+    validate({ params: IdParam, body: ResolveBody }),
+    wrap((req, res) => {
+      const updated = store.resolveDispute(Number(req.params.id), req.body.freelancerBps);
+      maybeAttachReceipt(req, res, updated);
+      return updated;
+    }),
+  );
+  v1.post(
+    '/contracts/:id/cancel',
+    requireAuth,
+    validate({ params: IdParam, body: CancelBody }),
+    wrap((req, res) => {
+      const updated = store.cancel(Number(req.params.id), callerOf(req));
+      maybeAttachReceipt(req, res, updated);
+      return updated;
+    }),
+  );
+  v1.post(
+    '/contracts/:id/reputation',
+    requireAuth,
+    validate({ params: IdParam, body: RateBody }),
+    wrap((req, res) => {
+      const reputation = store.rate(Number(req.params.id), req.body.rating, callerOf(req));
+      // The receipt covers the contract (now reputationIssued), not the reputation summary.
+      maybeAttachReceipt(req, res, store.get(Number(req.params.id)));
+      return reputation;
+    }),
+  );
+  v1.get(
+    '/reputation/:address',
+    validate({ params: ReputationAddressParam }),
+    wrap((req) => store.getReputationWithClient(req.params.address)),
+  );
+  v1.post(
+    '/contracts/:id/reviews',
+    requireAuth,
+    wrap((req, res) => {
+      const body = req.body ?? {};
+      const caller = callerOf(req);
+      if (caller !== undefined && body.reviewer !== undefined && body.reviewer !== caller) {
+        throw new HttpError(403, 'forbidden', 'reviewer must match the authenticated address');
+      }
+      res.status(201).json(store.createReview(id(req), caller === undefined ? body : { ...body, reviewer: caller }));
+    }),
+  );
   v1.post(
     '/contracts/:id/link',
     wrap(async (req) => store.linkEscrow(id(req), req.body?.escrowId, chainReader)),
@@ -205,8 +654,81 @@ export function createApp(
     '/contracts/:id/parity',
     wrap(async (req) => store.checkParity(id(req), chainReader)),
   );
-  v1.get('/reputation/:address', wrap((req) => store.getReputation(req.params.address)));
+  v1.get(
+    '/reputation/:address/reviews',
+    wrap((req) => {
+      const limitRaw = req.query.limit;
+      const limit = typeof limitRaw === 'string' ? Number(limitRaw) : undefined;
+      const cursorRaw = req.query.cursor;
+      const cursor = typeof cursorRaw === 'string' ? Number(cursorRaw) : undefined;
+      return store.listReviews(req.params.address, {
+        role: optionalString(req.query.role),
+        limit: Number.isFinite(limit as number) ? (limit as number) : undefined,
+        cursor: Number.isFinite(cursor as number) ? cursor : undefined,
+      });
+    }),
+  );
+  v1.post(
+    '/receipts/verify',
+    wrap((req) => {
+      const receipt = req.body?.receipt;
+      if (!receipt || typeof receipt !== 'string') {
+        throw new HttpError(400, 'invalid_receipt', 'receipt must be a non-empty JWS string');
+      }
+      const verified = verifyReceipt(receipt, receiptManager().publicKey);
+      if (!verified.valid) {
+        return {
+          valid: false,
+          kid: verified.kid ?? null,
+          iat: verified.iat ?? null,
+          contractId: verified.contractId ?? null,
+          matchesCurrent: false,
+        };
+      }
+      let matchesCurrent = false;
+      if (verified.contractId) {
+        try {
+          matchesCurrent = hashContractState(store.get(verified.contractId)) === verified.contractHash;
+        } catch {
+          matchesCurrent = false;
+        }
+      }
+      return { valid: true, kid: verified.kid, iat: verified.iat, contractId: verified.contractId, matchesCurrent };
+    }),
+  );
+
   app.use('/api/v1', v1);
+
+  // Daily Vercel cron (see vercel.json); also callable manually with the bearer secret.
+  const expireContracts = wrap((req) => {
+    requireCronSecret(req);
+    const checkedAt = store.currentTime();
+    return { expired: store.sweepExpired(), checkedAt };
+  });
+  app.get('/api/cron/expire-contracts', expireContracts);
+  app.post('/api/cron/expire-contracts', expireContracts);
+
+  // Prometheus scrape endpoint; disabled (404) unless METRICS_TOKEN is set, checked per request.
+  const escrowContracts = registry.gauge('escrow_contracts', 'Escrow contracts by status', ['status']);
+  const escrowValueEscrowed = registry.gauge('escrow_value_escrowed', 'Value currently escrowed (base units)', []);
+  const escrowValueReleased = registry.gauge('escrow_value_released', 'Value released (base units)', []);
+  const processUptime = registry.gauge('process_uptime_seconds', 'Process uptime in seconds', []);
+  const nodejsHeapUsed = registry.gauge('nodejs_heap_used_bytes', 'Node.js heap used in bytes', []);
+  app.get('/metrics', (req, res, next) => {
+    const token = process.env.METRICS_TOKEN;
+    if (!token) return next(new HttpError(404, 'not_found', 'Metrics endpoint disabled'));
+    const auth = req.headers.authorization;
+    if (!auth || !constantTimeEqual(auth, `Bearer ${token}`)) {
+      return next(new HttpError(401, 'unauthorized', 'Invalid metrics token'));
+    }
+    const stats = store.stats();
+    for (const [status, count] of Object.entries(stats.byStatus)) escrowContracts.set({ status }, count);
+    escrowValueEscrowed.set({}, stats.totalEscrowed);
+    escrowValueReleased.set({}, stats.totalReleased);
+    processUptime.set({}, process.uptime());
+    nodejsHeapUsed.set({}, process.memoryUsage().heapUsed);
+    res.type('text/plain; version=0.0.4').send(registry.exposition());
+  });
 
   app.use((req, res) => {
     res.status(404).json({ error: 'not_found', message: `No route for ${req.method} ${req.path}`, requestId: req.id, docs: '/docs' });
@@ -217,6 +739,17 @@ export function createApp(
     const requestId = req.id;
     if (err instanceof HttpError) {
       res.status(err.status).json({ error: err.code, message: err.message, ...err.details, requestId });
+      return;
+    }
+    if (err instanceof TxBuildError) {
+      res
+        .status(err.status)
+        .json({
+          error: err.code,
+          message: err.message,
+          ...(err.contractError ? { contractError: err.contractError } : {}),
+          requestId,
+        });
       return;
     }
     if (err && typeof err === 'object' && (err as { type?: string }).type === 'entity.parse.failed') {
@@ -235,79 +768,6 @@ export function createApp(
   });
 
   return app;
-}
-
-function constantTimeEqual(a: string, b: string): boolean {
-  const ba = Buffer.from(a, 'utf8');
-  const bb = Buffer.from(b, 'utf8');
-  if (ba.length !== bb.length) return false;
-  return timingSafeEqual(ba, bb);
-}
-
-function parseLimit(v: unknown): number {
-  if (v === undefined) return 20;
-  const n = Number(typeof v === 'string' ? v : String(v));
-  if (!Number.isInteger(n) || n < 1 || n > 100) {
-    throw new HttpError(400, 'invalid_query', 'limit must be an integer between 1 and 100');
-  }
-  return n;
-}
-
-function parseSortParam(v: unknown): string {
-  if (v === undefined) return '-createdAt';
-  const s = typeof v === 'string' ? v : String(v);
-  const field = s.startsWith('-') ? s.slice(1) : s;
-  if (!['createdAt', 'updatedAt', 'totalAmount'].includes(field)) {
-    throw new HttpError(400, 'invalid_query', 'invalid sort');
-  }
-  return s;
-}
-
-function parseCursorParam(cursor: unknown, sort: string): { sort: string; lastValue: string; lastId: number } | undefined {
-  if (cursor === undefined || cursor === null || cursor === '') return undefined;
-  const cursorStr = typeof cursor === 'string' ? cursor : String(cursor);
-  const parts = cursorStr.split('.');
-  if (parts.length !== 2) throw new HttpError(400, 'invalid_cursor', 'invalid cursor');
-  const [payload, sig] = parts;
-  let obj: { sort?: unknown; lastValue?: unknown; lastId?: unknown };
-  try {
-    obj = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-  } catch {
-    throw new HttpError(400, 'invalid_cursor', 'invalid cursor');
-  }
-  const expectedSig = createHmac('sha256', CURSOR_SECRET).update(payload).digest('base64url');
-  if (!constantTimeEqual(sig, expectedSig)) throw new HttpError(400, 'invalid_cursor', 'invalid cursor');
-  if (obj.sort !== sort) throw new HttpError(400, 'invalid_cursor', 'cursor sort does not match requested sort');
-  return { sort: sort, lastValue: String(obj.lastValue ?? ''), lastId: Number(obj.lastId ?? 0) };
-}
-
-function parseFilters(q: Request['query']): QueryFilters {
-  const f: QueryFilters = {};
-  if (typeof q.status === 'string') {
-    f.status = q.status.split(',').map((s) => s.trim()).filter(Boolean);
-    for (const status of f.status) {
-      if (!['Created', 'Funded', 'Completed', 'Disputed', 'Resolved', 'Cancelled'].includes(status)) {
-        throw new HttpError(400, 'invalid_query', 'invalid status');
-      }
-    }
-  }
-  if (typeof q.party === 'string') f.party = q.party;
-  if (typeof q.role === 'string') {
-    if (f.party === undefined) throw new HttpError(400, 'invalid_query', 'role requires party');
-    if (q.role !== 'client' && q.role !== 'freelancer') throw new HttpError(400, 'invalid_query', 'invalid role');
-    f.role = q.role;
-  }
-  if (typeof q.token === 'string') f.token = q.token;
-  if (typeof q.createdAfter === 'string') f.createdAfter = q.createdAfter;
-  if (typeof q.createdBefore === 'string') f.createdBefore = q.createdBefore;
-  if (typeof q.linked === 'string') f.linked = q.linked === 'true';
-  return f;
-}
-
-function serializeCursor(cursor: Cursor): string {
-  const payload = Buffer.from(JSON.stringify({ sort: cursor.sort, lastValue: cursor.lastValue, lastId: cursor.lastId })).toString('base64url');
-  const sig = createHmac('sha256', CURSOR_SECRET).update(payload).digest('base64url');
-  return `${payload}.${sig}`;
 }
 
 export default createApp;

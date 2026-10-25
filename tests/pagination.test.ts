@@ -2,8 +2,17 @@ import request from 'supertest';
 import { createApp } from '../src/app';
 import { EscrowStore } from '../src/store';
 
+/**
+ * Store whose clock advances one second per reading, so contracts created in a
+ * loop get distinct, increasing createdAt values (the store returns copies, so
+ * timestamps cannot be patched after creation).
+ */
+function steppedStore(): EscrowStore {
+  let t = Date.now() - 3_600_000;
+  return new EscrowStore(() => new Date((t += 1000)));
+}
+
 function makeContracts(store: EscrowStore, count: number, baseId = 1) {
-  const base = Date.now();
   const created: number[] = [];
   for (let i = 0; i < count; i++) {
     const c = store.create({
@@ -12,8 +21,6 @@ function makeContracts(store: EscrowStore, count: number, baseId = 1) {
       freelancer: `GFR${String(baseId + i).padStart(6, '0')}`,
       milestones: [{ title: `M${baseId + i}`, amount: (baseId + i) * 10 }],
     });
-    c.createdAt = new Date(base + i * 1000).toISOString();
-    c.updatedAt = c.createdAt;
     created.push(c.id);
   }
   return created;
@@ -27,7 +34,7 @@ async function fetchPage(app: ReturnType<typeof createApp>, limit: number, curso
 
 describe('contract list pagination, sorting and filters', () => {
   it('default response returns data with newest 20', async () => {
-    const store = new EscrowStore();
+    const store = steppedStore();
     makeContracts(store, 25);
     const app = createApp(store);
     const res = await request(app).get('/api/v1/contracts');
@@ -45,7 +52,7 @@ describe('contract list pagination, sorting and filters', () => {
   });
 
   it('paginates 25 contracts with limit=10 via cursors, no duplicates or gaps', async () => {
-    const store = new EscrowStore();
+    const store = steppedStore();
     makeContracts(store, 25);
     const app = createApp(store);
 
@@ -90,7 +97,7 @@ describe('contract list pagination, sorting and filters', () => {
   });
 
   it('filters by status alone and combined', async () => {
-    const store = new EscrowStore();
+    const store = steppedStore();
     makeContracts(store, 3); // ids 1..3 Created
     store.create({ client: 'GA', freelancer: 'GB', milestones: [{ amount: 100 }] }); // id 4 Created
     // fund one to make it Funded
@@ -171,7 +178,7 @@ describe('contract list pagination, sorting and filters', () => {
   });
 
   it('rejects tampered cursor', async () => {
-    const store = new EscrowStore();
+    const store = steppedStore();
     makeContracts(store, 25);
     const app = createApp(store);
     const first = await request(app).get('/api/v1/contracts?limit=1');
@@ -180,13 +187,13 @@ describe('contract list pagination, sorting and filters', () => {
     expect(cursor).toBeTruthy();
 
     const tampered = await request(app)
-      .get(`/api/v1/contracts?limit=1&cursor=${encodeURIComponent(cursor.slice(0, -1) + 'X')}`);
+      .get(`/api/v1/contracts?limit=1&cursor=${encodeURIComponent(cursor.slice(0, -1) + (cursor.endsWith('A') ? 'B' : 'A'))}`);
     expect(tampered.status).toBe(400);
     expect(tampered.body.error).toBe('invalid_cursor');
   });
 
   it('rejects cursor reused with a different sort', async () => {
-    const store = new EscrowStore();
+    const store = steppedStore();
     makeContracts(store, 25);
     const app = createApp(store);
     const first = await request(app).get('/api/v1/contracts?limit=5&sort=-createdAt');
@@ -198,7 +205,7 @@ describe('contract list pagination, sorting and filters', () => {
   });
 
   it('does not duplicate items when a contract is created between pages (sort=createdAt)', async () => {
-    const store = new EscrowStore();
+    const store = steppedStore();
     makeContracts(store, 10);
     const app = createApp(store);
     const first = await request(app).get('/api/v1/contracts?limit=5&sort=createdAt');
