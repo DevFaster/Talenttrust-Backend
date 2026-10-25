@@ -7,6 +7,12 @@ import { openapi, docsHtml } from './openapi';
 import { createLogger, type Logger, randomUUID } from './logger';
 import { ChainReader, SorobanRpcChainReader } from './chain';
 import { bigIntReplacer } from './amount';
+import {
+  createRegistry,
+  type Registry,
+  HTTP_DURATION_BUCKETS,
+  constantTimeEqual,
+} from './metrics';
 
 declare global {
   namespace Express {
@@ -66,6 +72,7 @@ function resolveStoreAndLogger(
 export interface AppOptions {
   idempotencyStore?: IdempotencyStore;
   idempotencyRequired?: boolean;
+  registry?: Registry;
 }
 
 export function createApp(
@@ -77,6 +84,7 @@ export function createApp(
   const store = resolved.store;
   const logger = resolved.logger;
   const chainReader = fallbackChainReader ?? resolved.chainReader;
+  const registry = options.registry ?? createRegistry();
 
   const app = express();
   app.disable('x-powered-by');
@@ -116,6 +124,36 @@ export function createApp(
     next();
   });
 
+  const httpRequestsTotal = registry.counter(
+    'http_requests_total',
+    'Total number of HTTP requests',
+    ['method', 'route', 'status'],
+  );
+  const httpRequestDuration = registry.histogram(
+    'http_request_duration_seconds',
+    'HTTP request duration in seconds',
+    ['method', 'route'],
+    HTTP_DURATION_BUCKETS,
+  );
+
+  app.use((req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => {
+      const durationSeconds = (Date.now() - start) / 1000;
+      const route = req.route ? req.baseUrl + req.route.path : 'unmatched';
+      httpRequestsTotal.inc({ method: req.method, route, status: String(res.statusCode) });
+      httpRequestDuration.observe({ method: req.method, route }, durationSeconds);
+    });
+    next();
+  });
+
+  const escrowMutationsTotal = registry.counter(
+    'escrow_mutations_total',
+    'Total number of escrow mutations',
+    ['action', 'result'],
+  );
+  store.setMutationRecorder((action, result) => escrowMutationsTotal.inc({ action, result }));
+
   app.get(
     '/',
     wrap(() => ({
@@ -147,6 +185,7 @@ export function createApp(
         'POST /api/v1/contracts/:id/link',
         'GET  /api/v1/contracts/:id/parity',
         'GET  /api/v1/reputation/:address',
+        'GET  /metrics',
       ],
     })),
   );
@@ -265,6 +304,34 @@ export function createApp(
     });
     res.status(500).json({ error: 'internal_error', message: 'Unexpected error', requestId });
   });
+
+  // /metrics endpoint
+  if (process.env.METRICS_TOKEN) {
+    const escrowContracts = registry.gauge('escrow_contracts', 'Escrow contracts by status', ['status']);
+    const escrowValueEscrowed = registry.gauge('escrow_value_escrowed', 'Value currently escrowed', []);
+    const escrowValueReleased = registry.gauge('escrow_value_released', 'Value released', []);
+    const processUptime = registry.gauge('process_uptime_seconds', 'Process uptime in seconds', []);
+    const nodejsHeapUsed = registry.gauge('nodejs_heap_used_bytes', 'Node.js heap used in bytes', []);
+
+    app.get('/metrics', (req, res) => {
+      const auth = req.headers['authorization'];
+      const provided = Array.isArray(auth) ? auth[0] : auth;
+      const expected = 'Bearer ' + process.env.METRICS_TOKEN!;
+      if (!provided || !constantTimeEqual(provided, expected)) {
+        res.status(401).json({ error: 'unauthorized', message: 'Invalid metrics token' });
+        return;
+      }
+      const stats = store.stats();
+      for (const [status, count] of Object.entries(stats.byStatus)) {
+        escrowContracts.set({ status }, count);
+      }
+      escrowValueEscrowed.set({}, stats.totalEscrowed);
+      escrowValueReleased.set({}, stats.totalReleased);
+      processUptime.set({}, process.uptime());
+      nodejsHeapUsed.set({}, process.memoryUsage().heapUsed);
+      res.type('text/plain; version=0.0.4').send(registry.exposition());
+    });
+  }
 
   return app;
 }

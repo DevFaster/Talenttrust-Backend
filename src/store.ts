@@ -127,6 +127,16 @@ const MAX_MILESTONES = 20;
 const MAX_REVISIONS = 50;
 const ACTIVE: ContractStatus[] = ['Created', 'Funded'];
 
+/** Mutation actions for metrics recording. */
+export type MutationAction =
+  | 'create'
+  | 'deposit'
+  | 'release'
+  | 'dispute'
+  | 'resolve'
+  | 'cancel'
+  | 'rate';
+
 /** Validate a milestones array into internal (bigint) milestones. */
 function parseMilestones(input: unknown): InternalContract['milestones'] {
   if (!Array.isArray(input) || input.length === 0) {
@@ -198,6 +208,15 @@ export class EscrowStore {
   private contracts = new Map<number, InternalContract>();
   private reputation = new Map<string, { completed: number; total: number }>();
   private nextId = 1;
+  private mutationRecorder?: (action: MutationAction, result: string) => void;
+
+  setMutationRecorder(fn: (action: MutationAction, result: string) => void): void {
+    this.mutationRecorder = fn;
+  }
+
+  private record(action: MutationAction, result: string): void {
+    this.mutationRecorder?.(action, result);
+  }
 
   list(filter: { status?: string; party?: string; linked?: boolean } = {}): EscrowContract[] {
     return [...this.contracts.values()]
@@ -256,6 +275,7 @@ export class EscrowStore {
       updatedAt: now,
     };
     this.contracts.set(c.id, c);
+    this.record('create', 'ok');
     return toPublic(c);
   }
 
@@ -304,6 +324,7 @@ export class EscrowStore {
     c.revisions.push({ revision: c.revision, at, changes });
     if (c.revisions.length > MAX_REVISIONS) c.revisions.shift();
     c.updatedAt = at;
+    this.record('edit', 'ok');
     return toPublic(c);
   }
 
@@ -320,6 +341,7 @@ export class EscrowStore {
       throw new HttpError(409, 'contract_locked', 'Contract can only be withdrawn before funding');
     }
     this.contracts.delete(id);
+    this.record('delete', 'ok');
   }
 
   private requireActive(c: InternalContract) {
@@ -345,6 +367,7 @@ export class EscrowStore {
     }
     c.fundedAmount = newFunded;
     if (c.fundedAmount === c.totalAmount) c.status = 'Funded';
+    this.record('deposit', 'ok');
     return this.touch(c);
   }
 
@@ -362,6 +385,7 @@ export class EscrowStore {
     m.released = true;
     c.releasedAmount = checkedAdd(c.releasedAmount, m.amount, 'releasedAmount');
     if (c.milestones.every((x) => x.released)) c.status = 'Completed';
+    this.record('release', 'ok');
     return this.touch(c);
   }
 
@@ -377,6 +401,7 @@ export class EscrowStore {
       reason: typeof reason === 'string' && reason ? reason : 'No reason given',
       openedAt: new Date().toISOString(),
     };
+    this.record('dispute', 'ok');
     return this.touch(c);
   }
 
@@ -401,6 +426,7 @@ export class EscrowStore {
       c.dispute.freelancerBps = bps;
       c.dispute.resolvedAt = new Date().toISOString();
     }
+    this.record('resolve', 'ok');
     return this.touch(c);
   }
 
@@ -408,6 +434,7 @@ export class EscrowStore {
     const c = this.getInternal(id);
     this.requireActive(c);
     c.status = 'Cancelled';
+    this.record('cancel', 'ok');
     return this.touch(c);
   }
 
@@ -429,6 +456,7 @@ export class EscrowStore {
     this.reputation.set(c.freelancer, r);
     c.reputationIssued = true;
     this.touch(c);
+    this.record('rate', 'ok');
     return this.getReputation(c.freelancer);
   }
 
@@ -509,6 +537,7 @@ export class EscrowStore {
 
     const now = new Date().toISOString();
     c.chain = { escrowId, linkedAt: now, lastVerifiedAt: now, status: 'in_sync', drift: [] };
+    this.record('linkEscrow', 'ok');
     return this.touch(c);
   }
 
@@ -581,6 +610,7 @@ export class EscrowStore {
     c.chain.status = parityStatus;
     c.chain.drift = drift;
     this.touch(c);
+    this.record('checkParity', 'ok');
 
     return { status: parityStatus, drift, checkedAt: now, latestLedger: result.latestLedger };
   }
