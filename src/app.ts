@@ -25,7 +25,7 @@ import { ChainReader, SorobanRpcChainReader } from './chain';
 import { buildEscrowTransaction, TxBuildError, type RpcClient } from './stellar/escrowTxBuilder';
 import { bigIntReplacer } from './amount';
 import { createRegistry, type Registry, HTTP_DURATION_BUCKETS, constantTimeEqual } from './metrics';
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto';
+import { createHash, createHmac, timingSafeEqual } from 'crypto';
 import { StrKey, Keypair } from '@stellar/stellar-sdk';
 import { randomBytes } from 'crypto';
 import { buildChallenge, verifyChallenge, consumeNonce } from './auth/challenge';
